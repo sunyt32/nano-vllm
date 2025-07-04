@@ -72,14 +72,21 @@ class LLMEngine:
             self.add_request(prompt, sp)
         outputs = {}
         prefill_throughput = decode_throughput = 0.
+        prefill_total_tokens = decode_total_tokens = 0
+        prefill_total_time = decode_total_time = 0.
         while not self.is_finished():
             t = perf_counter()
             output, num_tokens = self.step()
+            elapsed = perf_counter() - t
             if use_tqdm:
                 if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - t)
+                    prefill_total_tokens += num_tokens
+                    prefill_total_time += elapsed
+                    prefill_throughput = prefill_total_tokens / prefill_total_time if prefill_total_time > 0 else 0
                 else:
-                    decode_throughput = -num_tokens / (perf_counter() - t)
+                    decode_total_tokens -= num_tokens
+                    decode_total_time += elapsed
+                    decode_throughput = decode_total_tokens / decode_total_time if decode_total_time > 0 else 0
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
                     "Decode": f"{int(decode_throughput)}tok/s",

@@ -122,7 +122,7 @@ class ModelRunner:
             self.sparse_max_tables = torch.zeros(hf_config.num_hidden_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, hf_config.head_dim)
             self.sparse_min_tables = torch.zeros(hf_config.num_hidden_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, hf_config.head_dim)
             self.block_attention_workspace = torch.zeros((config.max_num_seqs, num_kv_heads, config.max_model_len // config.sparse_block_size), dtype=torch.float32)
-            self.sparse_indices_workspace = torch.full((config.max_num_seqs, num_kv_heads, config.max_model_len // config.sparse_block_size), -1, dtype=torch.int32)
+            self.sparse_indices_workspace = torch.zeros((config.max_num_seqs, num_kv_heads, config.max_model_len // config.sparse_block_size), dtype=torch.int32)
             layer_id = 0
             for module in self.model.modules():
                 if hasattr(module, "kv_manager"):

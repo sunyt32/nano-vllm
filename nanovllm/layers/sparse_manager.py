@@ -96,7 +96,7 @@ def _bitonic_merge(
         triton.Config({}, num_warps=num_warps, num_stages=2)
         for num_warps in [1, 2, 4, 8]
     ],
-    key=['head_dim', 'num_splits'],
+    key=['head_dim', 'num_kv_heads', 'num_splits'],
 )
 @triton.jit
 def block_attention_kernel(
@@ -286,6 +286,35 @@ def get_num_blocks(cache_seqlens, block_size, sparse_ratio, min_block_num):
     num_selected_blocks = torch.maximum(num_selected_blocks, num_blocks.clamp(max=min_block_num)).long()
     return num_blocks, num_selected_blocks
 
+@triton.jit
+def update_centeroids_kernel(
+    key,
+    k_max,
+    k_min,
+    slot_mapping,
+    block_size: tl.constexpr,
+    H: tl.constexpr,
+    D: tl.constexpr,
+):
+    i_b = tl.program_id(0)
+    i_h = tl.program_id(1)
+
+    p_k = key + i_b * D * H + i_h * D + tl.arange(0, D)
+    s_k = tl.load(slot_mapping + i_b)
+    new_blocks = s_k % block_size == 0
+    block_ids = s_k // block_size
+    b_k = tl.load(p_k)
+    p_k_max = k_max + block_ids * D * H + i_h * D + tl.arange(0, D)
+    p_k_min = k_min + block_ids * D * H + i_h * D + tl.arange(0, D)
+    if new_blocks:
+        tl.store(p_k_max, b_k)
+        tl.store(p_k_min, b_k)
+    else:
+        old_k_max = tl.load(p_k_max)
+        old_k_min = tl.load(p_k_min)
+        tl.store(p_k_max, tl.maximum(old_k_max, b_k))
+        tl.store(p_k_min, tl.minimum(old_k_min, b_k))
+
 class KVManager:
     def __init__(self, num_heads, block_size, sparse_ratio, local_num_blocks, min_block_num):
         self.num_heads = num_heads
@@ -301,14 +330,10 @@ class KVManager:
         assert self.sparse_max_table.numel() > 0 and self.sparse_min_table.numel() > 0, "sparse_max_table and sparse_min_table should not be empty"
         block_init(key, self.sparse_max_table, self.sparse_min_table, cu_seqlens, slot_mapping, self.block_size)
         
-    @torch.compile(fullgraph=True)
     def update_centeroids(self, key, slot_mapping):
-        new_blocks = slot_mapping % self.block_size == 0
-        block_ids = slot_mapping // self.block_size
-        sparse_max_table = self.sparse_max_table.flatten(0, 1)
-        sparse_min_table = self.sparse_min_table.flatten(0, 1)
-        sparse_max_table[block_ids] = torch.where(new_blocks[:, None, None], key, torch.maximum(sparse_max_table[block_ids], key))
-        sparse_min_table[block_ids] = torch.where(new_blocks[:, None, None], key, torch.minimum(sparse_min_table[block_ids], key))
+        batch, num_kv_heads, head_dim = key.shape
+        with torch.cuda.device(key.device.index): 
+            update_centeroids_kernel[(batch, num_kv_heads)](key, self.sparse_max_table, self.sparse_min_table, slot_mapping, self.block_size, num_kv_heads, head_dim, num_stages=1, num_warps=4)
 
     def get_kv_cache_indices(self, query, cache_seqlens, block_tables):
         bsz, num_heads, head_dim = query.shape
