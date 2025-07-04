@@ -9,12 +9,13 @@ from nanovllm.layers.layernorm import RMSNorm
 from nanovllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
 from nanovllm.layers.rotary_embedding import get_rope
 from nanovllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
-
+from nanovllm.config import Config
 
 class Qwen3Attention(nn.Module):
 
     def __init__(
         self,
+        layer_id: int,
         hidden_size: int,
         num_heads: int,
         num_kv_heads: int,
@@ -24,9 +25,15 @@ class Qwen3Attention(nn.Module):
         qkv_bias: bool = False,
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None,
+        sparse_decoding: bool = False,
+        sparse_block_size: int = 16,
+        sparse_block_ratio: float = 0.1,
+        sparse_min_num_blocks: int = 16,
+        sparse_local_num_blocks: int = 1,
     ) -> None:
         super().__init__()
         tp_size = dist.get_world_size()
+        self.layer_id = layer_id
         self.total_num_heads = num_heads
         assert self.total_num_heads % tp_size == 0
         self.num_heads = self.total_num_heads // tp_size
@@ -58,10 +65,16 @@ class Qwen3Attention(nn.Module):
             rope_scaling=rope_scaling,
         )
         self.attn = Attention(
+            self.layer_id,
             self.num_heads,
             self.head_dim,
             self.scaling,
             self.num_kv_heads,
+            sparse_decoding=sparse_decoding,
+            sparse_block_size=sparse_block_size,
+            sparse_block_ratio=sparse_block_ratio,
+            sparse_min_num_blocks=sparse_min_num_blocks,
+            sparse_local_num_blocks=sparse_local_num_blocks,
         )
         self.q_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
         self.k_norm = RMSNorm(self.head_dim, eps=rms_norm_eps)
@@ -118,10 +131,13 @@ class Qwen3DecoderLayer(nn.Module):
 
     def __init__(
         self,
+        layer_id: int,
         config: Qwen3Config,
+        vllm_config: Config,
     ) -> None:
         super().__init__()
         self.self_attn = Qwen3Attention(
+            layer_id=layer_id,
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -131,6 +147,11 @@ class Qwen3DecoderLayer(nn.Module):
             head_dim=getattr(config, 'head_dim', None),
             rope_theta=getattr(config, "rope_theta", 1000000),
             rope_scaling=getattr(config, "rope_scaling", None),
+            sparse_decoding=vllm_config.sparse_decoding,
+            sparse_block_size=vllm_config.sparse_block_size,
+            sparse_block_ratio=vllm_config.sparse_block_ratio,
+            sparse_min_num_blocks=vllm_config.sparse_min_num_blocks,
+            sparse_local_num_blocks=vllm_config.sparse_local_num_blocks,
         )
         self.mlp = Qwen3MLP(
             hidden_size=config.hidden_size,
@@ -162,10 +183,11 @@ class Qwen3Model(nn.Module):
     def __init__(
         self,
         config: Qwen3Config,
+        vllm_config: Config,
     ) -> None:
         super().__init__()
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
-        self.layers = nn.ModuleList([Qwen3DecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3DecoderLayer(layer_id, config, vllm_config) for layer_id in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
     def forward(
@@ -192,10 +214,11 @@ class Qwen3ForCausalLM(nn.Module):
 
     def __init__(
         self,
-        config: Qwen3Config
+        config: Qwen3Config,
+        vllm_config: Config,
     ) -> None:
         super().__init__()
-        self.model = Qwen3Model(config)
+        self.model = Qwen3Model(config, vllm_config)
         self.lm_head = ParallelLMHead(config.vocab_size, config.hidden_size)
         if config.tie_word_embeddings:
             self.lm_head.weight.data = self.model.embed_tokens.weight.data

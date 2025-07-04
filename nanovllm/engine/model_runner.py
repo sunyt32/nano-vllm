@@ -26,9 +26,9 @@ class ModelRunner:
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
-        torch.set_default_dtype(hf_config.torch_dtype)
+        torch.set_default_dtype(config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        self.model = Qwen3ForCausalLM(hf_config, config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
         self.warmup_model()
@@ -107,7 +107,7 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        assert config.num_kvcache_blocks > 0, "There is no enough GPU memory to allocate KV cache"
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -115,6 +115,25 @@ class ModelRunner:
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+        if config.sparse_decoding:
+            assert self.block_size % config.sparse_block_size == 0
+            sparse_indices_per_block = self.block_size // config.sparse_block_size
+            self.sparse_max_tables = torch.zeros(hf_config.num_hidden_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, hf_config.head_dim)
+            self.sparse_min_tables = torch.zeros(hf_config.num_hidden_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, hf_config.head_dim)
+            self.block_attention_workspace = torch.zeros((config.max_num_seqs, num_kv_heads, config.max_model_len // config.sparse_block_size), dtype=torch.float32)
+            self.sparse_indices_workspace = torch.full((config.max_num_seqs, num_kv_heads, config.max_model_len // config.sparse_block_size), -1, dtype=torch.int32)
+            layer_id = 0
+            for module in self.model.modules():
+                if hasattr(module, "kv_manager"):
+                    module.kv_manager.sparse_max_table = self.sparse_max_tables[layer_id]
+                    module.kv_manager.sparse_min_table = self.sparse_min_tables[layer_id]
+                    module.kv_manager.block_attention_workspace = self.block_attention_workspace
+                    module.kv_manager.sparse_indices_workspace = self.sparse_indices_workspace
+                    module.kv_manager.max_num_blocks = config.max_model_len // config.sparse_block_size
+                    layer_id += 1
+        else:
+            self.sparse_max_table = self.sparse_min_table = self.block_attention_workspace = self.sparse_indices_workspace = None
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

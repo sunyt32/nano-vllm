@@ -5,6 +5,8 @@ import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from nanovllm.utils.context import get_context
+from nanovllm.layers.sparse_manager import KVManager
+from nanovllm.layers.flash_sparse_decoding import flash_block_sparse_decoding
 
 
 @triton.jit
@@ -43,17 +45,25 @@ class Attention(nn.Module):
 
     def __init__(
         self,
+        layer_id,
         num_heads,
         head_dim,
         scale,
         num_kv_heads,
+        sparse_decoding,
+        sparse_block_size,
+        sparse_block_ratio,
+        sparse_min_num_blocks,
+        sparse_local_num_blocks,
     ):
         super().__init__()
+        self.layer_id = layer_id
         self.num_heads = num_heads
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
         self.k_cache = self.v_cache = torch.tensor([])
+        self.kv_manager = KVManager(num_kv_heads, sparse_block_size, sparse_block_ratio, sparse_local_num_blocks, sparse_min_num_blocks) if sparse_decoding else None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         o: torch.Tensor
@@ -65,6 +75,8 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
+            if self.kv_manager and self.kv_manager.sparse_max_table.numel():
+                self.kv_manager.init_centeroids(k, context.cu_seqlens_q, context.slot_mapping)
             if context.block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
@@ -72,8 +84,19 @@ class Attention(nn.Module):
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
         else:    # decode
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                        cache_seqlens=context.context_lens, block_table=context.block_tables, 
-                                        softmax_scale=self.scale, causal=True)
+            if self.kv_manager:
+                self.kv_manager.update_centeroids(k, context.slot_mapping)
+                sparse_indices, num_selected_blocks = self.kv_manager.get_kv_cache_indices_fast(q, context.context_lens, context.block_tables)
+                o = flash_block_sparse_decoding(q, k_cache, v_cache,
+                                                cache_seqlens=context.context_lens,
+                                                block_indices=sparse_indices,
+                                                num_selected_blocks=num_selected_blocks,
+                                                block_tables=context.block_tables,
+                                                sm_scale=self.scale,
+                                                block_size=self.kv_manager.block_size)
+            else:
+                o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
+                                            cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                            softmax_scale=self.scale, causal=True)
         o = o.view(-1, self.num_heads * self.head_dim)
         return o

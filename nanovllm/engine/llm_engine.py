@@ -1,5 +1,5 @@
 import atexit
-from dataclasses import fields
+import logging
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
@@ -11,13 +11,11 @@ from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
 
+logger = logging.getLogger(__name__)
 
 class LLMEngine:
-
-    def __init__(self, model, **kwargs):
-        config_fields = {field.name for field in fields(Config)}
-        config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
-        config = Config(model, **config_kwargs)
+    def __init__(self, config: Config):
+        self.config = config
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -42,6 +40,10 @@ class LLMEngine:
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
+        if len(prompt) + sampling_params.max_tokens > self.config.max_model_len:
+            logger.warning(f"Prompt length {len(prompt)} + max tokens {sampling_params.max_tokens} exceeds max model length {self.config.max_model_len}, truncating prompt...")
+            truncate_prefix = len(prompt) - self.config.max_model_len + sampling_params.max_tokens
+            prompt = prompt[truncate_prefix:]
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
 
