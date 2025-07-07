@@ -137,7 +137,10 @@ def _fwd_kernel_decoding(
 
     l_recip = 1 / l_i[:, None]
     acc = acc * l_recip
-    m_i += tl.math.log(l_i)
+    if num_selected_blocks > 0:
+        m_i += tl.math.log(l_i)
+    else:
+        m_i = tl.zeros([BLOCK_H], dtype=tl.float32)
 
     l_ptrs = L + offs_m * stride_lh
     tl.store(l_ptrs, m_i, mask=(offs_m < gqa_group_size))
@@ -176,7 +179,7 @@ def combine(
     po_local = tl.load(out_partial + off_z * stride_op_z + off_h * stride_op_h + split[:, None] * stride_op_s + tl.arange(0, BLOCK_V) * stride_op_d, mask=split_mask[:, None])
     scale_local = tl.exp(lse_local - lse_logsum_local)
     accum_local = tl.sum(po_local * scale_local[:, None], axis=0)
-    tl.store(out + off_z * stride_o_z + off_h * stride_o_h + tl.arange(0, BLOCK_V) * stride_o_d, accum_local)
+    tl.store(out + off_z * stride_o_z + off_h * stride_o_h + tl.arange(0, BLOCK_V) * stride_o_d, accum_local.to(out.type.element_ty))
 
 def flash_block_sparse_decoding(
     q, k, v,
