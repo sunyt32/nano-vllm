@@ -31,66 +31,6 @@ def num_splits_heuristic(total_mblocks, max_splits):
 
     return 1
 
-@triton.jit
-def _compare_and_swap(
-    x,
-    ids,
-    flip,
-    i: tl.constexpr,
-    n_dims: tl.constexpr,
-):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    shape: tl.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
-    y = tl.reshape(x, shape)
-    # slice left/right with 'stride' 2**(n_dims - i - 1)
-    mask = tl.arange(0, 2)[None, :, None]
-    left = tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(y.dtype)
-    right = tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(y.dtype)
-    left = tl.reshape(left, x.shape)
-    right = tl.reshape(right, x.shape)
-    # idx
-    y_idx = tl.reshape(ids, shape)
-    left_idx = tl.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape)
-    right_idx = tl.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape)
-    left_idx = tl.reshape(left_idx, x.shape).to(y_idx.dtype)
-    right_idx = tl.reshape(right_idx, x.shape).to(y_idx.dtype)
-    # actual compare-and-swap
-    idtype = tl.core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
-    ileft = left.to(idtype, bitcast=True)
-    iright = right.to(idtype, bitcast=True)
-    ix = x.to(idtype, bitcast=True)
-
-    cond = (left > right) != flip
-    ret = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
-    new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
-    return ret.to(x.dtype, bitcast=True), new_ids
-
-
-@triton.jit
-def _bitonic_merge(
-    x,
-    ids,
-    stage: tl.constexpr,
-    order: tl.constexpr,
-    n_dims: tl.constexpr,
-):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    tl.static_assert(stage <= n_dims)
-    # flip denotes whether to re-arrange sub-sequences of elements in ascending or
-    # descending order.
-    # if flip = 00000000... then all elements will be re-arranged ascendingly at this stage
-    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
-    # a stride of 2) at this stage
-    if order == 2:
-        shape: tl.constexpr = [n_outer * 2**(n_dims - 1 - stage), 2, 2**stage]
-        flip = tl.reshape(tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape)
-    else:
-        flip = order
-    # perform `stage` rounds of `compare-and-swap`
-    for i in tl.static_range(stage):
-        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
-    return x, ids
-
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=2)
@@ -205,11 +145,11 @@ def block_init_kernel(
     H: tl.constexpr,
     D: tl.constexpr,
 ):
-    i_h = tl.program_id(0)
-    i_m = tl.program_id(1)
+    i_h = tl.program_id(0).to(tl.int64)
+    i_m = tl.program_id(1).to(tl.int64)
 
-    i_n, i_t = tl.load(chunk_indices + i_m * 2).to(tl.int32), tl.load(chunk_indices + i_m * 2 + 1).to(tl.int32)
-    bos, eos = tl.load(cu_seqlens + i_n).to(tl.int32), tl.load(cu_seqlens + i_n + 1).to(tl.int32)
+    i_n, i_t = tl.load(chunk_indices + i_m * 2).to(tl.int64), tl.load(chunk_indices + i_m * 2 + 1).to(tl.int64)
+    bos, eos = tl.load(cu_seqlens + i_n).to(tl.int64), tl.load(cu_seqlens + i_n + 1).to(tl.int64)
     seqlen = eos - bos
     k_idx = i_t * block_size + tl.arange(0, block_size)
     mask = k_idx < seqlen
@@ -218,8 +158,10 @@ def block_init_kernel(
     b_k = tl.load(p_k, mask=mask[:, None])
     b_k_min = tl.where(mask[:, None], b_k, 1e6)
     b_k_max = tl.where(mask[:, None], b_k, -1e6)
-    tl.store(k_min + H * D * s_k + i_h * D + tl.arange(0, D), tl.min(b_k_min, axis=0))
-    tl.store(k_max + H * D * s_k + i_h * D + tl.arange(0, D), tl.max(b_k_max, axis=0))
+    b_k_min = tl.min(b_k_min, axis=0)
+    b_k_max = tl.max(b_k_max, axis=0)
+    tl.store(k_min + H * D * s_k + i_h * D + tl.arange(0, D), b_k_min)
+    tl.store(k_max + H * D * s_k + i_h * D + tl.arange(0, D), b_k_max)
 
 def block_init(k, k_max, k_min, cu_seqlens, slot_mapping, block_size):
     L, H, D = k.shape
@@ -233,33 +175,53 @@ def block_init(k, k_max, k_min, cu_seqlens, slot_mapping, block_size):
         )
 
 @triton.jit
-def get_topk_indices_kernel(
-    block_attn_score,
-    topk_indices,
-    num_blocks,
-    num_selected_blocks,
+def radix_topk_indices_kernel(
+    block_attn_score,       # [B, H, L]
+    indices_out,            # [B, H, K], int32 output indices
+    num_blocks,             # total number of blocks = N // BLOCK_SIZE
+    num_select_blocks,      # total number of select blocks = K // BLOCK_SIZE
     N_POW2: tl.constexpr,
     stride_bb, stride_bh, stride_bl,
-    stride_tb, stride_th, stride_tl,
+    stride_mbb, stride_mbh, stride_mbl,
 ):
-    off_b = tl.program_id(0).to(tl.int64)
-    off_h = tl.program_id(1).to(tl.int64)
+    bid = tl.program_id(0).to(tl.int64)
+    hid = tl.program_id(1).to(tl.int64)
 
-    N = tl.load(num_blocks + off_b)
-    N_SEL = tl.load(num_selected_blocks + off_b)
-    ids = tl.arange(0, N_POW2)
-    sort_ids = tl.arange(0, N_POW2)
-    attn_score_ptr = block_attn_score + off_b * stride_bb + off_h * stride_bh + ids * stride_bl
-    x = tl.load(attn_score_ptr, mask=ids < N, other=-1e38)
+    N = tl.load(num_blocks + bid)
+    N_SEL = tl.load(num_select_blocks + bid)
+    offs = tl.arange(0, N_POW2)
 
-    n_dims: tl.constexpr = int(math.log2(N_POW2))
-    for i in tl.static_range(1, n_dims + 1):
-        x, sort_ids = _bitonic_merge(x, sort_ids, i, 2 if i < n_dims else 1, n_dims)
+    # Load score
+    block_scores_ptr = block_attn_score + bid * stride_bb + hid * stride_bh + offs * stride_bl
+    block_scores = tl.load(block_scores_ptr, mask=offs < N, other=-float('inf'))
+    # === Step 1: float32 转为可比较的 uint32 ===
+    score_u32 = tl.cast(block_scores, tl.uint32, bitcast=True)
+    sign_bit = score_u32 >> 31
+    flip_mask = sign_bit * 0xFFFFFFFF
+    scores_ord = score_u32 ^ (flip_mask | 0x80000000)
+    # === Step 2: 初始化候选 mask ===
+    is_candidate = tl.full([N_POW2], False, tl.int1)
+    is_current_candidate = offs < N
 
-    sort_ids = tl.where(ids < N_SEL, sort_ids, N_POW2)
-    sort_ids = tl.sort(sort_ids, dim=0, descending=False)
-    topk_indices_ptr = topk_indices + off_b * stride_tb + off_h * stride_th + ids * stride_tl
-    tl.store(topk_indices_ptr, sort_ids, mask=ids < N_SEL)
+    # === Step 3: 32轮 Bit 筛选 ===
+    for bit in range(31, -1, -1):
+        bit_mask = 1 << bit
+        current_bits = (scores_ord & bit_mask) >> bit
+        is_bit1 = tl.where(is_current_candidate, current_bits, 0).to(tl.int32)
+        count_bit1 = tl.sum(is_bit1)
+        if count_bit1 >= N_SEL:
+            is_current_candidate &= (is_bit1 == 1)
+        else:
+            is_candidate |= (is_bit1 == 1)
+            is_current_candidate &= (is_bit1 == 0)
+            N_SEL = N_SEL - count_bit1
+
+    is_current_candidate &= (tl.cumsum(is_current_candidate.to(tl.int32)) <= N_SEL)
+    is_candidate |= is_current_candidate
+
+    is_candidate_ptr = tl.cumsum(is_candidate.to(tl.int32)) - 1
+    # === Step 4: 输出 TopK indices ===
+    tl.store(indices_out + bid * stride_mbb + hid * stride_mbh + is_candidate_ptr * stride_mbl, offs, mask=is_candidate)
 
 def get_topk_indices(
     block_attn_score,
@@ -276,7 +238,7 @@ def get_topk_indices(
     N_POW2 = triton.next_power_of_2(max_num_blocks)
     grid = (B, H)
     with torch.cuda.device(block_attn_score.device.index): 
-        get_topk_indices_kernel[grid](block_attn_score, topk_indices, num_blocks, num_selected_blocks, N_POW2, *block_attn_score.stride(), *topk_indices.stride())
+        radix_topk_indices_kernel[grid](block_attn_score, topk_indices, num_blocks, num_selected_blocks, N_POW2, *block_attn_score.stride(), *topk_indices.stride())
     return topk_indices
 
 @torch.compile(fullgraph=True)
@@ -370,7 +332,7 @@ def main():
     pages = bsz * n_kv_seq // page_size
     gqa_size = 6
     block_size = 32
-    dtype = torch.float16
+    dtype = torch.bfloat16
     xq = torch.randn((bsz, n_head * gqa_size, key_dim), device='cuda', dtype=dtype)
     cache_seqlens = torch.randint(100, n_kv_seq, (bsz,), device='cuda', dtype=torch.int32)
     xk = torch.randn((cache_seqlens.sum().item(), n_head, key_dim), device='cuda', dtype=dtype)

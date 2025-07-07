@@ -44,7 +44,7 @@ class Config:
         parser.add_argument('--tensor_parallel_size', type=int, default=1, help='Tensor parallel size')
         parser.add_argument('--enforce_eager', action='store_true', help='Enforce eager mode')
         parser.add_argument('--eos', type=int, default=-1, help='End of sequence token')
-        parser.add_argument('--dtype', type=str, default='float16', choices=['float16', 'float32'], help='Data type')
+        parser.add_argument('--dtype', type=str, default='bfloat16', choices=['bfloat16', 'float16'], help='Data type')
         parser.add_argument('--kvcache_block_size', type=int, default=256, help='KV cache block size')
         parser.add_argument('--sparse_decoding', action='store_true', help='Enable sparse decoding')
                 
