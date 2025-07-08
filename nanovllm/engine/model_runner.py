@@ -39,6 +39,7 @@ class ModelRunner:
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
+        # 创建共享内存，供各个进程之间通信。0号创建，其他进程等待创建并使用。
         if self.world_size > 1:
             if rank == 0:
                 self.shm = SharedMemory(name="nanovllm", create=True, size=2**20)
@@ -99,7 +100,9 @@ class ModelRunner:
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         if not hasattr(hf_config, "head_dim"):
             hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
+        # 计算每个block里的token，要使用多少kv cache空间。
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+        # 计算能用多少个block，使得最终gpu空间利用率是0.9=gpu_memory_utilization（算上已经被使用的GPU显存）
         config.num_kvcache_blocks = int(total * gpu_memory_utilization - used) // block_bytes
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0

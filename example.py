@@ -4,9 +4,12 @@ from transformers import AutoTokenizer
 
 
 def main():
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
+    path = os.path.expanduser("/data/yaoyaochang/code/speech/data/Qwen/Qwen3-0.6B")
+    path = os.path.expanduser("/data/yaoyaochang/code/speech/data/Qwen/Qwen2-0.5B")
+    path = os.path.expanduser("/data/yaoyaochang/code/speech/data/Qwen/Qwen2.5-0.5B")
+    path = os.path.expanduser("/data/yaoyaochang/code/speech/data/Qwen/Qwen2.5-0.5B-Instruct")
     tokenizer = AutoTokenizer.from_pretrained(path)
-    llm = LLM(path, enforce_eager=True, tensor_parallel_size=1)
+    llm = LLM(path, enforce_eager=False, tensor_parallel_size=1, cuda_start_idx=2)
 
     sampling_params = SamplingParams(temperature=0.6, max_tokens=256)
     prompts = [

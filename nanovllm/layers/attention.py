@@ -1,9 +1,11 @@
 import torch
 from torch import nn
-import triton
+import triton # Python写cuda kernel的库
 import triton.language as tl
 
 from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+# flash_attn_varlen_func：做可变长度批次的 FlashAttention 前向计算。用 packed 格式处理所有样本的真实长度 → 不浪费内存
+# flash_attn_with_kvcache：用于解码阶段，做 FlashAttention 前向计算，使用 KV cache。
 from nanovllm.utils.context import get_context
 
 
