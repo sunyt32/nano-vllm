@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
+from nanovllm.models.qwen2 import Qwen2ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -22,17 +23,17 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
-
+    
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
-        torch.cuda.set_device(rank)
+        torch.cuda.set_device(rank + config.cuda_start_idx)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        # self.model = Qwen3ForCausalLM(hf_config)
+        self.model = Qwen2ForCausalLM(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
-        self.warmup_model()
-        self.allocate_kv_cache()
+        self.allocate_kv_cache(config.gpu_memory_utilization)
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -77,6 +78,7 @@ class ModelRunner:
         assert self.world_size > 1 and not self.rank
         data = pickle.dumps([method_name, *args])
         n = len(data)
+        assert n + 4 <= self.shm.size
         self.shm.buf[0:4] = n.to_bytes(4, "little")
         self.shm.buf[4:n+4] = data
         for event in self.event:
@@ -86,28 +88,19 @@ class ModelRunner:
         if self.world_size > 1 and self.rank == 0:
             self.write_shm(method_name, *args)
         method = getattr(self, method_name, None)
+        assert callable(method)
         return method(*args)
 
-    def warmup_model(self):
-        torch.cuda.empty_cache()
-        torch.cuda.reset_peak_memory_stats()
-        max_num_batched_tokens, max_model_len = self.config.max_num_batched_tokens, self.config.max_model_len
-        num_seqs = min(max_num_batched_tokens // max_model_len, self.config.max_num_seqs)
-        seqs = [Sequence([0] * max_model_len) for _ in range(num_seqs)]
-        self.run(seqs, True)
-        torch.cuda.empty_cache()
-
-    def allocate_kv_cache(self):
+    def allocate_kv_cache(self, gpu_memory_utilization):
         config = self.config
         hf_config = config.hf_config
         free, total = torch.cuda.mem_get_info()
         used = total - free
-        peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
-        current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        if not hasattr(hf_config, "head_dim"):
+            hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        config.num_kvcache_blocks = int(total * gpu_memory_utilization - used) // block_bytes
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
         layer_id = 0
         for module in self.model.modules():
@@ -118,7 +111,10 @@ class ModelRunner:
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
+        block_tables = [
+            seq.block_table + [-1] * (max_len - len(seq.block_table))
+            for seq in seqs
+        ]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -141,8 +137,6 @@ class ModelRunner:
             cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
             max_seqlen_q = max(seqlen_q, max_seqlen_q)
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
-            if not seq.block_table:
-                continue
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:
@@ -150,6 +144,7 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
+        assert len(input_ids) == len(slot_mapping)
         if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
             block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
@@ -186,7 +181,7 @@ class ModelRunner:
         return temperatures
 
     @torch.inference_mode()
-    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
+    def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill):
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
             return self.model.compute_logits(self.model(input_ids, positions))
         else:
@@ -215,6 +210,12 @@ class ModelRunner:
 
     @torch.inference_mode()
     def capture_cudagraph(self):
+        get_rng_state = torch.cuda.get_rng_state
+        set_rng_state = torch.cuda.set_rng_state
+        rng_state = torch.cuda.get_rng_state()
+        torch.cuda.get_rng_state = lambda: rng_state
+        torch.cuda.set_rng_state = lambda _: None
+    
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
@@ -249,3 +250,6 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+        torch.cuda.get_rng_state = get_rng_state
+        torch.cuda.set_rng_state = set_rng_state
