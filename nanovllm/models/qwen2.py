@@ -149,6 +149,13 @@ class Qwen2DecoderLayer(nn.Module):
         return hidden_states, residual
 
 class Qwen2Model(nn.Module):
+    packed_modules_mapping = {
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1),
+    }
     def __init__(
         self,
         config: Qwen2Config
@@ -157,13 +164,59 @@ class Qwen2Model(nn.Module):
         self.embed_tokens = VocabParallelEmbedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([Qwen2DecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        print(f"init Qwen2Model here at {self.__class__.__name__} with config: {config}")
 
     def forward(
         self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor
+        input_ids: torch.Tensor | None = None,
+        positions: torch.Tensor | None = None,
+        hidden_states: torch.Tensor | None = None
     ) -> torch.Tensor:
-        hidden_states = self.embed_tokens(input_ids)
+        if hidden_states is None:
+            hidden_states = self.embed_tokens(input_ids)
+        # 以下都是enforce_eager=True时输出的信息
+        # print(f"input_ids.shape = {input_ids.shape}") # [2] 2=batchsize  
+        # print(f"positions.shape = {positions.shape}") # [2]
+        # print(f"hidden_states.shape = {hidden_states.shape}") # [2, 896] 896是hidden size
+        # print(f"input_ids = {input_ids}") # 2个数字，分别表示各自seq的最新token id
+        # print(f"positions = {positions}") # 2个数字，分别表示各自seq的位置信息，从小数字一直涨
+        # '''
+        # prefilling：多个seq拼接起来一起prefill
+        # input_ids.shape = torch.Size([70])
+        # positions.shape = torch.Size([70])
+        # hidden_states.shape = torch.Size([70, 896])
+        # input_ids = tensor([151644,   8948,    198,   2610,    525,   1207,  16948,     11,   3465,
+        #         553,  54364,  14817,     13,   1446,    525,    264,  10950,  17847,
+        #             13, 151645,    198, 151644,    872,    198,    396,  47845,   6133,
+        #         151645,    198, 151644,  77091,    198, 151644,   8948,    198,   2610,
+        #         525,   1207,  16948,     11,   3465,    553,  54364,  14817,     13,
+        #         1446,    525,    264,  10950,  17847,     13, 151645,    198, 151644,
+        #         872,    198,   1607,    678,  10250,   5109,   2878,    220,     16,
+        #             15,     15, 151645,    198, 151644,  77091,    198],
+        #     device='cuda:2')
+        # positions = tensor([ 0,  1,  2,  3,  4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17,
+        #         18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31,  0,  1,  2,  3,
+        #         4,  5,  6,  7,  8,  9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+        #         22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37]
+                
+        # decode：接着最新的input_ids和positions继续decode，一个token一个token的decode，输入是多个seq的最新一个token
+        # input_ids.shape = torch.Size([2])
+        # positions.shape = torch.Size([2])
+        # hidden_states.shape = torch.Size([2, 896])
+        # input_ids = tensor([ 9707, 39814], device='cuda:2')
+        # positions = tensor([33, 39], device='cuda:2')
+        # input_ids.shape = torch.Size([2])
+        # positions.shape = torch.Size([2])
+        # hidden_states.shape = torch.Size([2, 896])
+        # input_ids = tensor([0, 0], device='cuda:2')
+        # positions = tensor([34, 40], device='cuda:2')
+        # '''
+        # with open("tmp.txt", "a") as f:
+        #     f.write(f"input_ids.shape = {input_ids.shape}\n")
+        #     f.write(f"positions.shape = {positions.shape}\n")
+        #     f.write(f"hidden_states.shape = {hidden_states.shape}\n")
+        #     f.write(f"input_ids = {input_ids}\n")
+        #     f.write(f"positions = {positions}\n")
         residual = None
         for layer in self.layers:
             hidden_states, residual = layer(positions, hidden_states, residual)
