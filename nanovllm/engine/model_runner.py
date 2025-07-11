@@ -7,7 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence
 from nanovllm.models.qwen3 import Qwen3ForCausalLM
-from nanovllm.models.qwen2 import Qwen2ForCausalLM
+from nanovllm.models.qwen2 import Qwen2ForCausalLM, Qwen2Model
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
@@ -30,8 +30,10 @@ class ModelRunner:
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
         # self.model = Qwen3ForCausalLM(hf_config)
-        self.model = Qwen2ForCausalLM(hf_config)
+        self.model = Qwen2ForCausalLM(hf_config) # for this repo
         load_model(self.model, config.model)
+        # self.model = Qwen2Model(hf_config) # for transformers
+        # load_model(self.model, "/data/yaoyaochang/code/speech/data/Qwen/Qwen2.5-1.5B-from-vibepod2")
         self.sampler = Sampler()
         self.allocate_kv_cache(config.gpu_memory_utilization)
         if not self.enforce_eager:
@@ -102,12 +104,24 @@ class ModelRunner:
             hf_config.head_dim = hf_config.hidden_size // hf_config.num_attention_heads
         # 计算每个block里的token，要使用多少kv cache空间。
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
-        # 计算能用多少个block，使得最终gpu空间利用率是0.9=gpu_memory_utilization（算上已经被使用的GPU显存）
+        # 计算能用多少个block，使得最终gpu空间利用率是0.9=gpu_memory_utilization（算上已经被使用的GPU显存后达到0.9）
         config.num_kvcache_blocks = int(total * gpu_memory_utilization - used) // block_bytes
         self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
+        print(f"free GPU memory: {free / 1024**3:.2f} GB, total GPU memory: {total / 1024**3:.2f} GB, used GPU memory: {used / 1024**3:.2f} GB") # free = total = 44GB
+        print(f"hf_config.num_hidden_layers = {hf_config.num_hidden_layers}") # 24 (qwen2-0.5B)
+        print(f"self.block_size = {self.block_size}") # 256
+        print(f"num_kv_heads = {num_kv_heads}") # 2
+        print(f"hf_config.head_dim = {hf_config.head_dim}") # 64
+        print(f"hf_config.torch_dtype.itemsize = {hf_config.torch_dtype.itemsize}") # 2
+        print(f"block_bytes = {block_bytes}") # 3145728 = 3M
+        print(f"config.num_kvcache_blocks = {config.num_kvcache_blocks}") # 13123
+        print(f"self.kv_cache.shape = {self.kv_cache.shape}") # torch.Size([2, 24, 13123, 256, 2, 64])
+        print(f"self.kv_cache size = {self.kv_cache.element_size() * self.kv_cache.nelement()}") # 41GB
         layer_id = 0
         for module in self.model.modules():
-            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"): # qwen2-0.5B的24层layer里的Attention module
+                # print module name
+                # print(f"{layer_id} module {module.__class__.__name__}") # 0-23, module Attention
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
@@ -190,7 +204,7 @@ class ModelRunner:
         else:
             bs = input_ids.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)] # 拿到的graph是大于等于bs的最小值，还是可能会比bs大，稍微浪费一点计算
             graph_vars = self.graph_vars
             for k, v in graph_vars.items():
                 if k != "outputs":
