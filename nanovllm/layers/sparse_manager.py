@@ -269,83 +269,61 @@ def sort_topk_indices_kernel(
 @triton.jit
 def radix_topk_indices_kernel(
     block_attn_score,       # [B, H, L]
+    indices_in,             # [B, H, K], int32 output indices
     indices_out,            # [B, H, K], int32 output indices
-    candidate,              # [B, H, N], bool output topk mask
-    current_candidate,      # [B, H, N], bool output current topk mask
     num_blocks,             # total number of blocks = N // BLOCK_SIZE
     num_select_blocks,      # total number of select blocks = K // BLOCK_SIZE
     BLOCK_SIZE: tl.constexpr,
     RADIX_BITS: tl.constexpr,
+    num_splits: tl.constexpr,
     stride_bb, stride_bh, stride_bl,
-    stride_mbb, stride_mbh, stride_mbl,
-    stride_sb, stride_sh, stride_sl,
+    stride_ib, stride_ih, stride_il,
+    stride_ob, stride_oh, stride_ol,
 ):
     bid = tl.program_id(0).to(tl.int64)
     hid = tl.program_id(1).to(tl.int64)
+    split = tl.program_id(2).to(tl.int64)
 
     N = tl.load(num_blocks + bid)
     N_SEL = tl.load(num_select_blocks + bid)
+    N_ITER = N_SEL
 
-    # === Step 1: 初始化候选 mask ===
-    for i in range(0, N, BLOCK_SIZE):
-        is_candidate = tl.full([BLOCK_SIZE], False, tl.int1)
-        index = i + tl.arange(0, BLOCK_SIZE)
-        is_current_candidate = index < N
-        tl.store(candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, is_candidate, mask=is_current_candidate)
-        tl.store(current_candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, is_current_candidate, mask=is_current_candidate)
+    blocks_per_split = N // num_splits
+    remaining_blocks = N % num_splits
+    loop_range = blocks_per_split + (1 if split < remaining_blocks else 0)
+    start = blocks_per_split * split + min(split, remaining_blocks)
 
+    block_indices = tl.arange(0, BLOCK_SIZE)
+    indices = tl.load(indices_in + bid * stride_ib + hid * stride_ih + (start + block_indices) * stride_il, mask=block_indices < loop_range)
+    scores = tl.load(block_attn_score + bid * stride_bb + hid * stride_bh + indices * stride_bl, mask=block_indices < loop_range)
+    is_candidate = tl.full([BLOCK_SIZE], False, tl.int1)
+    is_current_candidate = tl.arange(0, BLOCK_SIZE) < loop_range
     # === Step 2: 32轮 Bit 筛选 ===
     for bit in range(32 // RADIX_BITS):
         bit_count = tl.zeros([2 ** RADIX_BITS], tl.int32)
         bit_range = (2 ** RADIX_BITS - 1) - tl.arange(0, 2 ** RADIX_BITS)
-        for i in range(0, N, BLOCK_SIZE):
-            index = i + tl.arange(0, BLOCK_SIZE)
-            scores = tl.load(block_attn_score + bid * stride_bb + hid * stride_bh + index * stride_bl, mask=index < N)
-            is_current_candidate = tl.load(current_candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, mask=index < N)
-            scores = (scores >> (32 // RADIX_BITS - 1 - bit) * RADIX_BITS) & (2 ** RADIX_BITS - 1)
-            bit_mask = bit_range[:, None] == scores[None, :]
-            bit_mask &= is_current_candidate[None, :]
-            bit_count += tl.sum(bit_mask.to(tl.int32), axis=1)
+        scores_shift = (scores >> (32 // RADIX_BITS - 1 - bit) * RADIX_BITS) & (2 ** RADIX_BITS - 1)
+        bit_mask = bit_range[:, None] == scores_shift[None, :]
+        bit_mask &= is_current_candidate[None, :]
+        bit_count += tl.sum(bit_mask.to(tl.int32), axis=1)
         
-        sel_bit_count = tl.cumsum(bit_count) < N_SEL
+        sel_bit_count = tl.cumsum(bit_count) < N_ITER
         bit_rank = tl.sum(sel_bit_count.to(tl.int32))
         bit_count = tl.where(tl.arange(0, 2 ** RADIX_BITS) < bit_rank, bit_count, 0)
-        N_SEL = N_SEL - tl.sum(bit_count)
-        for i in range(0, N, BLOCK_SIZE):
-            index = i + tl.arange(0, BLOCK_SIZE)
-            mask = index < N
-            scores = tl.load(block_attn_score + bid * stride_bb + hid * stride_bh + index * stride_bl, mask=mask)
-            is_candidate = tl.load(candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, mask=mask)
-            is_current_candidate = tl.load(current_candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, mask=mask)
-            scores = (scores >> (32 // RADIX_BITS - 1 - bit) * RADIX_BITS) & (2 ** RADIX_BITS - 1)
-            bit_mask = bit_range[:, None] == scores[None, :]
-            bit_mask &= is_current_candidate[None, :]
-            is_next_candidate = bit_mask & (tl.arange(0, 2 ** RADIX_BITS) < bit_rank)[:, None]
-            is_next_candidate = tl.sum(is_next_candidate.to(tl.int32), axis=0)
-            is_next_current_candidate = bit_mask & (tl.arange(0, 2 ** RADIX_BITS) == bit_rank)[:, None]
-            is_next_current_candidate = tl.sum(is_next_current_candidate.to(tl.int32), axis=0)
-            is_candidate |= is_next_candidate.to(tl.int1)
-            is_current_candidate &= is_next_current_candidate.to(tl.int1)
-            tl.store(candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, is_candidate, mask=mask)
-            tl.store(current_candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, is_current_candidate, mask=mask)
+        N_ITER = N_ITER - tl.sum(bit_count)
 
-    for i in range(0, N, BLOCK_SIZE):
-        index = i + tl.arange(0, BLOCK_SIZE)
-        mask = index < N
-        is_candidate = tl.load(candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, mask=mask)
-        is_current_candidate = tl.load(current_candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, mask=mask)
-        is_current_candidate &= (tl.cumsum(is_current_candidate.to(tl.int32)) <= N_SEL)
-        is_candidate |= is_current_candidate
-        N_SEL = N_SEL - tl.sum(is_current_candidate.to(tl.int32))
-        tl.store(candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, is_candidate, mask=mask)
+        is_next_candidate = bit_mask & (tl.arange(0, 2 ** RADIX_BITS) < bit_rank)[:, None]
+        is_next_candidate = tl.sum(is_next_candidate.to(tl.int32), axis=0)
+        is_next_current_candidate = bit_mask & (tl.arange(0, 2 ** RADIX_BITS) == bit_rank)[:, None]
+        is_next_current_candidate = tl.sum(is_next_current_candidate.to(tl.int32), axis=0)
+        is_candidate |= is_next_candidate.to(tl.int1)
+        is_current_candidate &= is_next_current_candidate.to(tl.int1)
 
-    current_ptr = 0
-    for i in range(0, N, BLOCK_SIZE):
-        index = i + tl.arange(0, BLOCK_SIZE)
-        is_candidate = tl.load(candidate + bid * stride_sb + hid * stride_sh + index * stride_sl, mask=index < N)
-        is_candidate_ptr = current_ptr + tl.cumsum(is_candidate.to(tl.int32)) - 1
-        tl.store(indices_out + bid * stride_mbb + hid * stride_mbh + is_candidate_ptr * stride_mbl, index, mask=is_candidate)
-        current_ptr += tl.sum(is_candidate.to(tl.int32))
+    is_current_candidate &= (tl.cumsum(is_current_candidate.to(tl.int32)) <= N_ITER)
+    is_candidate |= is_current_candidate
+
+    is_candidate_ptr = tl.cumsum(is_candidate.to(tl.int32)) - 1 + split * N_SEL
+    tl.store(indices_out + bid * stride_ob + hid * stride_oh + is_candidate_ptr * stride_ol, indices, mask=is_candidate)
 
 def get_topk_indices(
     block_attn_score,
@@ -354,18 +332,23 @@ def get_topk_indices(
     max_num_blocks,
     max_num_selected_blocks,
 ):
+    assert max_num_selected_blocks <= 8192, "max_num_selected_blocks should be less than or equal to 8192"
     B, H = num_blocks.shape[0], block_attn_score.shape[1]
-    topk_indices = torch.full((B, H, max_num_selected_blocks), -1, device=block_attn_score.device, dtype=torch.int32)
-    candidate = torch.zeros((B, H, max_num_blocks), device=block_attn_score.device, dtype=torch.bool)
-    current_candidate = torch.zeros((B, H, max_num_blocks), device=block_attn_score.device, dtype=torch.bool)
-    grid = (B, H)
-    # with torch.cuda.device(block_attn_score.device.index): 
-    #     sort_topk_indices_kernel[grid](block_attn_score, topk_indices, num_blocks, num_selected_blocks, triton.next_power_of_2(max_num_selected_blocks), *block_attn_score.stride(), *topk_indices.stride(), num_stages=3, num_warps=4)
-
-    BLOCK_SIZE, RADIX_BITS = 2048, 4
-    with torch.cuda.device(block_attn_score.device.index): 
-        radix_topk_indices_kernel[grid](block_attn_score, topk_indices, candidate, current_candidate, num_blocks, num_selected_blocks, BLOCK_SIZE, RADIX_BITS, *block_attn_score.stride(), *topk_indices.stride(), *candidate.stride(), num_stages=3, num_warps=8)
-    return topk_indices
+    BLOCK_SIZE, RADIX_BITS = min(16384, triton.next_power_of_2(max_num_selected_blocks * 4)), 4
+    # BLOCK_SIZE, RADIX_BITS = min(16384, triton.next_power_of_2(max_num_blocks)), 4
+    topk_indices_in = torch.arange(0, max_num_blocks, device=block_attn_score.device, dtype=torch.int32).repeat(B, H, 1)
+    while True:
+        num_splits = math.ceil(max_num_blocks / BLOCK_SIZE)
+        next_num_blocks = num_splits * max_num_selected_blocks
+        topk_indices_out = torch.full((B, H, next_num_blocks), -1, device=block_attn_score.device, dtype=torch.int32)
+        with torch.cuda.device(block_attn_score.device.index): 
+            radix_topk_indices_kernel[(B, H, num_splits)](block_attn_score, topk_indices_in, topk_indices_out, num_blocks, num_selected_blocks, BLOCK_SIZE, RADIX_BITS, num_splits, *block_attn_score.stride(), *topk_indices_in.stride(), *topk_indices_out.stride(), num_stages=2, num_warps=4)
+        topk_indices_in = topk_indices_out
+        num_blocks = torch.ceil(num_blocks / BLOCK_SIZE).to(torch.int32) * max_num_selected_blocks
+        if max_num_blocks <= BLOCK_SIZE:
+            break
+        max_num_blocks = next_num_blocks
+    return topk_indices_out
 
 @torch.compile(fullgraph=True)
 def get_topk_indices_fast(
@@ -468,7 +451,7 @@ class KVManager:
 def main():
     torch.cuda.manual_seed(0)
     bsz, n_head, key_dim = 8, 4, 256
-    n_kv_seq = 131072
+    n_kv_seq = 32768
     page_size = 256
     pages = bsz * n_kv_seq // page_size
     gqa_size = 6
@@ -521,8 +504,7 @@ def main():
         topk_indices_fast, _ = kv_manager.get_kv_cache_indices_fast(xq, cache_seqlens, block_tables)
     for _ in range(3):
         topk_indices, _ = kv_manager.get_kv_cache_indices(xq, cache_seqlens, block_tables)
-    print((topk_indices != topk_indices_fast).masked_fill(topk_indices == -1, False).sum(), topk_indices.numel())
-
+    print((topk_indices != topk_indices_fast).masked_fill(topk_indices == -1, False).sum(), (topk_indices != -1).sum(), (topk_indices_fast != -1).sum())
     torch.cuda.synchronize()
     start_time = time.time()
     for _ in range(100):
