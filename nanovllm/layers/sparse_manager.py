@@ -5,31 +5,8 @@ import triton.language as tl
 
 torch._dynamo.config.capture_scalar_outputs = True
 
-def num_splits_heuristic(total_mblocks, max_splits):
-    props = torch.cuda.get_device_properties(torch.device("cuda:0"))
-    num_sm = props.multi_processor_count
-    if total_mblocks >= 0.8 * num_sm:
-        return 1
-    
-    max_efficiency = 0.0
-    efficiency = []
-
-    # Compute efficiency for different splits
-    for num_splits in range(1, max_splits + 1):
-        n_waves = (total_mblocks * num_splits) / num_sm
-        eff = n_waves / math.ceil(n_waves)
-        # Track max efficiency
-        if eff > max_efficiency:
-            max_efficiency = eff
-
-        efficiency.append(eff)
-
-    # Find the smallest number of splits that achieves at least 85% of max efficiency
-    for num_splits in range(1, max_splits + 1):
-        if efficiency[num_splits - 1] >= 0.95 * max_efficiency:
-            return num_splits
-
-    return 1
+def num_splits_heuristic(total_mblocks, max_blocks=1024, max_splits=256):
+    return max(1, min(triton.cdiv(max_blocks, total_mblocks), max_splits))
 
 @triton.autotune(
     configs=[
@@ -89,20 +66,16 @@ def block_attention_kernel(
         score = tl.maximum(k_min_val * query, k_max_val * query)
         score = tl.sum(score, axis=1)
         score = tl.where(block_block_idx >= total_n_blocks - local_num_blocks, POS_INF, score)
-        score_u32 = tl.cast(score, tl.uint32, bitcast=True)
-        sign_bit = score_u32 >> 31
-        flip_mask = sign_bit * 0xFFFFFFFF
-        scores_ord = score_u32 ^ (flip_mask | 0x80000000)
         attn_score_ptr = attn_score + batch_idx * stride_ab + head_idx * stride_ah + block_block_idx * stride_ad
-        tl.store(attn_score_ptr, scores_ord, mask=block_mask)
+        tl.store(attn_score_ptr, score, mask=block_mask)
 
 def block_attention(q, k_min, k_max, num_blocks, local_num_blocks, block_tables, max_num_blocks):
     batch = q.shape[0]
     _, indices_per_page, n_kv_heads, head_dim = k_min.shape
-    attn_score = torch.zeros((batch, n_kv_heads, max_num_blocks), device=q.device, dtype=torch.uint32)
+    attn_score = torch.zeros((batch, n_kv_heads, max_num_blocks), device=q.device, dtype=torch.float32)
     BLOCK_N = 32
     BLOCK_PAGE = BLOCK_N // indices_per_page
-    num_splits = num_splits_heuristic(batch * n_kv_heads, max_splits=8)
+    num_splits = num_splits_heuristic(batch * n_kv_heads)
     assert BLOCK_N % indices_per_page == 0, "BLOCK_N should be divisible by indices_per_page"
     grid = (batch, n_kv_heads, num_splits)
     with torch.cuda.device(q.device.index): 
@@ -174,99 +147,6 @@ def block_init(k, k_max, k_min, cu_seqlens, slot_mapping, block_size):
         )
 
 @triton.jit
-def _compare_and_swap(
-    x,
-    ids,
-    flip,
-    i: tl.constexpr,
-    n_dims: tl.constexpr,
-):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    shape: tl.constexpr = [n_outer * 2**i, 2, 2**(n_dims - i - 1)]
-    y = tl.reshape(x, shape)
-    # slice left/right with 'stride' 2**(n_dims - i - 1)
-    mask = tl.arange(0, 2)[None, :, None]
-    left = tl.broadcast_to(tl.sum(y * (1 - mask), 1)[:, None, :], shape).to(y.dtype)
-    right = tl.broadcast_to(tl.sum(y * mask, 1)[:, None, :], shape).to(y.dtype)
-    left = tl.reshape(left, x.shape)
-    right = tl.reshape(right, x.shape)
-    # idx
-    y_idx = tl.reshape(ids, shape)
-    left_idx = tl.broadcast_to(tl.sum(y_idx * (1 - mask), 1)[:, None, :], shape)
-    right_idx = tl.broadcast_to(tl.sum(y_idx * mask, 1)[:, None, :], shape)
-    left_idx = tl.reshape(left_idx, x.shape).to(y_idx.dtype)
-    right_idx = tl.reshape(right_idx, x.shape).to(y_idx.dtype)
-    # actual compare-and-swap
-    idtype = tl.core.get_int_dtype(bitwidth=x.dtype.primitive_bitwidth, signed=True)
-    ileft = left.to(idtype, bitcast=True)
-    iright = right.to(idtype, bitcast=True)
-    ix = x.to(idtype, bitcast=True)
-
-    cond = (left > right) != flip
-    ret = ix ^ tl.where(cond, ileft ^ iright, tl.zeros_like(ix))
-    new_ids = ids ^ tl.where(cond, left_idx ^ right_idx, tl.zeros_like(ids))
-    return ret.to(x.dtype, bitcast=True), new_ids
-
-
-@triton.jit
-def _bitonic_merge(
-    x,
-    ids,
-    stage: tl.constexpr,
-    order: tl.constexpr,
-    n_dims: tl.constexpr,
-):
-    n_outer: tl.constexpr = x.numel >> n_dims
-    tl.static_assert(stage <= n_dims)
-    # flip denotes whether to re-arrange sub-sequences of elements in ascending or
-    # descending order.
-    # if flip = 00000000... then all elements will be re-arranged ascendingly at this stage
-    # if flip = 00110011... then all the elements will be re-arranged alternatingly (with
-    # a stride of 2) at this stage
-    if order == 2:
-        shape: tl.constexpr = [n_outer * 2**(n_dims - 1 - stage), 2, 2**stage]
-        flip = tl.reshape(tl.broadcast_to(tl.arange(0, 2)[None, :, None], shape), x.shape)
-    else:
-        flip = order
-    # perform `stage` rounds of `compare-and-swap`
-    for i in tl.static_range(stage):
-        x, ids = _compare_and_swap(x, ids, flip, i + (n_dims - stage), n_dims)
-    return x, ids
-
-@triton.jit
-def sort_topk_indices_kernel(
-    block_attn_score,       # [B, H, L]
-    indices_out,            # [B, H, K], int32 output indices
-    num_blocks,             # total number of blocks = N // BLOCK_SIZE
-    num_select_blocks,      # total number of select blocks = K // BLOCK_SIZE
-    N_SEL_POW2: tl.constexpr,
-    stride_bb, stride_bh, stride_bl,
-    stride_mbb, stride_mbh, stride_mbl,
-):
-    bid = tl.program_id(0).to(tl.int64)
-    hid = tl.program_id(1).to(tl.int64)
-
-    N = tl.load(num_blocks + bid)
-    N_SEL = tl.load(num_select_blocks + bid)
-    scores = tl.zeros([N_SEL_POW2 * 2], tl.uint32)
-    ids = tl.full([N_SEL_POW2 * 2], N, tl.int32)
-    space_mask = tl.arange(0, N_SEL_POW2 * 2) >= N_SEL_POW2
-    for i in range(0, N, N_SEL_POW2):
-        index = i + tl.arange(0, N_SEL_POW2 * 2) - N_SEL_POW2
-        mask = (index < N) & space_mask
-        local_scores = tl.load(block_attn_score + bid * stride_bb + hid * stride_bh + index * stride_bl, mask=mask)
-        scores = tl.where(mask, local_scores, scores)
-        ids = tl.where(mask, index, ids)
-        n_dims: tl.constexpr = tl.standard._log2(N_SEL_POW2 * 2)
-        for j in tl.static_range(1, n_dims + 1):
-            scores, ids = _bitonic_merge(scores, ids, j, 2 if j < n_dims else 1, n_dims)
-
-    final_mask = tl.arange(0, N_SEL_POW2 * 2) < N_SEL
-    ids = tl.where(final_mask, ids, N)
-    ids = tl.sort(ids, dim=0, descending=False)
-    tl.store(indices_out + bid * stride_mbb + hid * stride_mbh + tl.arange(0, N_SEL_POW2 * 2) * stride_mbl, ids, mask=final_mask)
-
-@triton.jit
 def radix_topk_indices_kernel(
     block_attn_score,       # [B, H, L]
     indices_in,             # [B, H, K], int32 output indices
@@ -325,6 +205,43 @@ def radix_topk_indices_kernel(
     is_candidate_ptr = tl.cumsum(is_candidate.to(tl.int32)) - 1 + split * N_SEL
     tl.store(indices_out + bid * stride_ob + hid * stride_oh + is_candidate_ptr * stride_ol, indices, mask=is_candidate)
 
+@triton.jit
+def mask_sort_kernel(
+    topk_indices,  # [B, H, K]
+    num_selected_blocks,  # [B]
+    stride_tb, stride_th, stride_tl,
+    max_num_selected_blocks: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    bid = tl.program_id(0)
+    hid = tl.program_id(1)
+    num_selected = tl.load(num_selected_blocks + bid)
+    offs = bid * stride_tb + hid * stride_th + tl.arange(0, BLOCK_SIZE) * stride_tl
+    mask = tl.arange(0, BLOCK_SIZE) < num_selected
+    indices = tl.load(topk_indices + offs, mask=mask, other=2147483647).to(tl.int32)
+    indices = tl.sort(indices, dim=0, descending=False)
+    indices = tl.where(mask, indices, -1)
+    mask = tl.arange(0, BLOCK_SIZE) < max_num_selected_blocks
+    tl.store(topk_indices + offs, indices.to(topk_indices.type.element_ty), mask=mask)
+
+def mask_sort(
+    topk_indices: torch.Tensor,
+    num_selected_blocks: torch.Tensor,
+    max_num_selected_blocks: int,
+):
+    B, H, K = topk_indices.shape
+    BLOCK_SIZE =  triton.next_power_of_2(max_num_selected_blocks)
+    with torch.cuda.device(topk_indices.device.index):
+        mask_sort_kernel[(B, H)](
+            topk_indices,
+            num_selected_blocks,
+            *topk_indices.stride(),
+            max_num_selected_blocks,
+            BLOCK_SIZE=BLOCK_SIZE,
+            num_warps=4,
+            num_stages=1,
+        )
+
 def get_topk_indices(
     block_attn_score,
     num_blocks,
@@ -332,35 +249,11 @@ def get_topk_indices(
     max_num_blocks,
     max_num_selected_blocks,
 ):
-    assert max_num_selected_blocks <= 8192, "max_num_selected_blocks should be less than or equal to 8192"
-    B, H = num_blocks.shape[0], block_attn_score.shape[1]
-    BLOCK_SIZE, RADIX_BITS = min(16384, triton.next_power_of_2(max_num_selected_blocks * 4)), 4
-    # BLOCK_SIZE, RADIX_BITS = min(16384, triton.next_power_of_2(max_num_blocks)), 4
-    topk_indices_in = torch.arange(0, max_num_blocks, device=block_attn_score.device, dtype=torch.int32).repeat(B, H, 1)
-    while True:
-        num_splits = math.ceil(max_num_blocks / BLOCK_SIZE)
-        next_num_blocks = num_splits * max_num_selected_blocks
-        topk_indices_out = torch.full((B, H, next_num_blocks), -1, device=block_attn_score.device, dtype=torch.int32)
-        with torch.cuda.device(block_attn_score.device.index): 
-            radix_topk_indices_kernel[(B, H, num_splits)](block_attn_score, topk_indices_in, topk_indices_out, num_blocks, num_selected_blocks, BLOCK_SIZE, RADIX_BITS, num_splits, *block_attn_score.stride(), *topk_indices_in.stride(), *topk_indices_out.stride(), num_stages=2, num_warps=4)
-        topk_indices_in = topk_indices_out
-        num_blocks = torch.ceil(num_blocks / BLOCK_SIZE).to(torch.int32) * max_num_selected_blocks
-        if max_num_blocks <= BLOCK_SIZE:
-            break
-        max_num_blocks = next_num_blocks
-    return topk_indices_out
-
-@torch.compile(fullgraph=True)
-def get_topk_indices_fast(
-    block_attn_score,
-    num_blocks,
-    num_selected_blocks,
-    max_num_blocks,
-    max_num_selected_blocks,
-):
-    topk_indices = torch.topk(block_attn_score.to(torch.int64), k=max_num_selected_blocks, dim=-1, sorted=True).indices
-    topk_indices = torch.masked_fill(topk_indices, torch.arange(max_num_selected_blocks, device=topk_indices.device) >= num_selected_blocks[:, None, None], max_num_blocks)
-    topk_indices = torch.sort(topk_indices, dim=-1, descending=False).values
+    topk_indices = torch.topk(block_attn_score, k=max_num_selected_blocks, dim=-1, sorted=True).indices
+    # topk_indices = torch.masked_fill(topk_indices, torch.arange(max_num_selected_blocks, device=topk_indices.device) >= num_selected_blocks[:, None, None], max_num_blocks)
+    # topk_indices = torch.sort(topk_indices, dim=-1, descending=False).values
+    # topk_indices = torch.masked_fill(topk_indices, topk_indices >= num_blocks[:, None, None], -1)
+    mask_sort(topk_indices, num_selected_blocks, max_num_selected_blocks)
     return topk_indices
 
 @torch.compile(fullgraph=True)

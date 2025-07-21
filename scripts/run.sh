@@ -6,5 +6,5 @@ python3 eval_mtnd.py \
 --tensor_parallel_size 1 \
 --gpu_memory_utilization 0.9 \
 --sparse_decoding \
-# --enforce_eager
+--enforce_eager
 

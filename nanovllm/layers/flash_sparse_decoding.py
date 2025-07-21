@@ -8,31 +8,8 @@ def is_hip():
     return triton.runtime.driver.active.get_current_target().backend == "hip"
 
 
-def num_splits_heuristic(total_mblocks, max_splits):
-    props = torch.cuda.get_device_properties(torch.device("cuda:0"))
-    num_sm = props.multi_processor_count
-    if total_mblocks >= 0.8 * num_sm:
-        return 1
-    
-    max_efficiency = 0.0
-    efficiency = []
-
-    # Compute efficiency for different splits
-    for num_splits in range(1, max_splits + 1):
-        n_waves = (total_mblocks * num_splits) / num_sm
-        eff = n_waves / math.ceil(n_waves)
-        # Track max efficiency
-        if eff > max_efficiency:
-            max_efficiency = eff
-
-        efficiency.append(eff)
-
-    # Find the smallest number of splits that achieves at least 85% of max efficiency
-    for num_splits in range(1, max_splits + 1):
-        if efficiency[num_splits - 1] >= 0.9 * max_efficiency:
-            return num_splits
-
-    return 1
+def num_splits_heuristic(total_mblocks, max_blocks=1024, max_splits=256):
+    return max(1, min(triton.cdiv(max_blocks, total_mblocks), max_splits))
 
 @triton.autotune(
     configs=[
@@ -210,8 +187,7 @@ def flash_block_sparse_decoding(
 
     total_mblocks = batch * n_kv_heads
     if num_splits is None:
-        num_splits = num_splits_heuristic(
-            total_mblocks, max_splits=32)
+        num_splits = num_splits_heuristic(total_mblocks)
 
     out_partial = torch.empty((batch, n_heads, num_splits, head_dim), device=q.device, dtype=torch.float32)
     out = torch.empty((batch, n_heads, head_dim), device=q.device, dtype=q.dtype)

@@ -5,6 +5,6 @@ python3 bench.py \
 --max_num_batched_tokens 131072 \
 --tensor_parallel_size 1 \
 --gpu_memory_utilization 0.8 \
---sparse_decoding \
+# --sparse_decoding \
 # --enforce_eager
 
