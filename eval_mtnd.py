@@ -116,9 +116,9 @@ def model_generation(model, ratio, prompt_needle_ctx, answer, limit):
     return final_acc
 
 def evaluate(model, limit):
-    all_ctx_sizes = [32768]
+    all_ctx_sizes = [8192]
     gold_index_ratios = [0, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1]
-    num_needles_list = [16]
+    num_needles_list = [1]
     # num_needles_list = [1, 2, 4, 8, 16]
     # all are long enough in base_ctx
     base_ctx = []

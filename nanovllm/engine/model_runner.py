@@ -17,7 +17,7 @@ class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
         self.config = config
-        hf_config = config.hf_config
+        model_args = config.model_args
         self.block_size = config.kvcache_block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
@@ -29,8 +29,8 @@ class ModelRunner:
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(config.dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config, config)
-        load_model(self.model, config.model)
+        self.model = Qwen3ForCausalLM(model_args, config)
+        load_model(self.model, config.model, config.checkpoint)
         self.sampler = Sampler()
         self.warmup_model()
         self.allocate_kv_cache()
@@ -100,39 +100,57 @@ class ModelRunner:
 
     def allocate_kv_cache(self):
         config = self.config
-        hf_config = config.hf_config
+        model_args = config.model_args
         free, total = torch.cuda.mem_get_info()
         used = total - free
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * hf_config.head_dim * hf_config.torch_dtype.itemsize
+        num_kv_heads = model_args.kv_head // self.world_size
+        num_cross_kv_heads = model_args.cross_kv_head // self.world_size if model_args.yoco_cross_layers > 0 else 0
+        kv_cache_layers = model_args.n_layers - model_args.yoco_cross_layers
+        block_bytes = 2 * kv_cache_layers * self.block_size * num_kv_heads * model_args.head_dim * self.config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0, "There is no enough GPU memory to allocate KV cache"
-        self.kv_cache = torch.zeros(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, hf_config.head_dim)
+        self.kv_cache = torch.zeros(2, kv_cache_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, model_args.head_dim)
+        self.cross_kv_cache = torch.zeros(2, config.num_kvcache_blocks, self.block_size, num_cross_kv_heads, model_args.cross_head_dim) if num_cross_kv_heads > 0 else None
+        self.window_size = model_args.yoco_window_size
         print(f"Global kv cache shape: {self.kv_cache.shape}")
         layer_id = 0
-        for module in self.model.modules():
+        for module in self.model.model.layers[:kv_cache_layers].modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
                 module.k_cache = self.kv_cache[0, layer_id]
                 module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
-
+        if self.cross_kv_cache is not None:
+            self.model.model.shared_attention.k_cache = self.cross_kv_cache[0]
+            self.model.model.shared_attention.v_cache = self.cross_kv_cache[1]
         if config.sparse_decoding:
             assert self.block_size % config.sparse_block_size == 0
             sparse_indices_per_block = self.block_size // config.sparse_block_size
-            self.sparse_max_tables = torch.zeros(hf_config.num_hidden_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, hf_config.head_dim)
-            self.sparse_min_tables = torch.zeros(hf_config.num_hidden_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, hf_config.head_dim)
+            max_num_blocks = config.max_model_len // config.sparse_block_size
+            max_num_selected_blocks = math.ceil(max_num_blocks * config.sparse_block_ratio)
+            self.sparse_max_tables = torch.zeros(kv_cache_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, model_args.head_dim)
+            self.sparse_min_tables = torch.zeros(kv_cache_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, model_args.head_dim)
+            self.cross_sparse_max_tables = torch.zeros(config.num_kvcache_blocks, sparse_indices_per_block, num_cross_kv_heads, model_args.cross_head_dim) if num_cross_kv_heads > 0 else None
+            self.cross_sparse_min_tables = torch.zeros(config.num_kvcache_blocks, sparse_indices_per_block, num_cross_kv_heads, model_args.cross_head_dim) if num_cross_kv_heads > 0 else None
             layer_id = 0
-            for module in self.model.modules():
+            for module in self.model.model.layers[kv_cache_layers:].modules():
                 if hasattr(module, "kv_manager"):
                     module.kv_manager.sparse_max_table = self.sparse_max_tables[layer_id]
                     module.kv_manager.sparse_min_table = self.sparse_min_tables[layer_id]
-                    module.kv_manager.max_num_blocks = config.max_model_len // config.sparse_block_size
-                    module.kv_manager.max_num_selected_blocks = math.ceil(module.kv_manager.max_num_blocks * config.sparse_block_ratio)
+                    module.kv_manager.max_num_blocks = max_num_blocks
+                    module.kv_manager.max_num_selected_blocks = max_num_selected_blocks
                     layer_id += 1
+                    if layer_id == kv_cache_layers:
+                        break
+            if self.cross_sparse_max_tables is not None:
+                self.model.model.shared_attention.kv_manager.sparse_max_table = self.cross_sparse_max_tables
+                self.model.model.shared_attention.kv_manager.sparse_min_table = self.cross_sparse_min_tables
+                self.model.model.shared_attention.kv_manager.max_num_blocks = max_num_blocks
+                self.model.model.shared_attention.kv_manager.max_num_selected_blocks = max_num_selected_blocks
         else:
             self.sparse_max_table = self.sparse_min_table = None
+            self.cross_sparse_max_table = self.cross_sparse_min_table = None
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
@@ -148,11 +166,12 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         slot_mapping = []
-        block_tables = None
+        context_lens = []
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
+            context_lens.append(seqlen)
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
             cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
@@ -168,14 +187,14 @@ class ModelRunner:
                 else:
                     end = start + seq.last_block_num_tokens 
                 slot_mapping.extend(list(range(start, end)))
-        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:    # prefix cache
-            block_tables = self.prepare_block_tables(seqs)
+        block_tables = self.prepare_block_tables(seqs)
         input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, context_lens, block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -234,7 +253,7 @@ class ModelRunner:
     @torch.inference_mode()
     def capture_cudagraph(self):
         config = self.config
-        hf_config = config.hf_config
+        model_args = config.model_args
         max_bs = min(self.config.max_num_seqs, 512)
         max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
@@ -242,7 +261,7 @@ class ModelRunner:
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
         context_lens = torch.zeros(max_bs, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
-        outputs = torch.zeros(max_bs, hf_config.hidden_size)
+        outputs = torch.zeros(max_bs, model_args.d_model)
         self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None

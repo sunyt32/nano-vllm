@@ -139,6 +139,35 @@ class QKVParallelLinear(ColumnParallelLinear):
         loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
         param_data.copy_(loaded_weight)
 
+class KVParallelLinear(ColumnParallelLinear):
+
+    def __init__(
+        self,
+        hidden_size: int,
+        head_size: int,
+        total_num_kv_heads: int,
+        bias: bool = False,
+    ):
+        self.head_size = head_size
+        self.total_num_kv_heads = total_num_kv_heads
+        tp_size = dist.get_world_size()
+        self.num_kv_heads = divide(self.total_num_kv_heads, tp_size)
+        input_size = hidden_size
+        output_size = (2 * self.total_num_kv_heads) * self.head_size
+        super().__init__(input_size, output_size, bias)
+
+    def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: str):
+        param_data = param.data
+        assert loaded_shard_id in ["k", "v"]
+        if loaded_shard_id == "k":
+            shard_size = self.num_kv_heads * self.head_size
+            shard_offset = 0
+        else:
+            shard_size = self.num_kv_heads * self.head_size
+            shard_offset = self.num_kv_heads * self.head_size
+        param_data = param_data.narrow(self.tp_dim, shard_offset, shard_size)
+        loaded_weight = loaded_weight.chunk(self.tp_size, self.tp_dim)[self.tp_rank]
+        param_data.copy_(loaded_weight)
 
 class RowParallelLinear(LinearBase):
 
