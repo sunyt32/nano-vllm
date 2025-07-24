@@ -2,7 +2,7 @@ from collections import deque
 
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
-from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.block_manager import BlockManager, SlidingBlockManager
 
 
 class Scheduler:
@@ -11,7 +11,8 @@ class Scheduler:
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size, config.model_args.yoco_window_size)
+        self.block_manager = SlidingBlockManager(config.num_kvcache_blocks, config.kvcache_block_size, config.model_args.yoco_window_size)
+        self.cross_block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -28,11 +29,12 @@ class Scheduler:
         num_batched_tokens = 0
         while self.waiting and num_seqs < self.max_num_seqs:
             seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq) or not self.cross_block_manager.can_allocate(seq):
                 break
             num_seqs += 1
             self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
+            self.cross_block_manager.allocate(seq)
+            num_batched_tokens += len(seq) - seq.num_cached_tokens - seq.num_released_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)
@@ -43,7 +45,7 @@ class Scheduler:
         # decode
         while self.running and num_seqs < self.max_num_seqs:
             seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_append(seq) or not self.cross_block_manager.can_append(seq):
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -52,6 +54,7 @@ class Scheduler:
             else:
                 num_seqs += 1
                 self.block_manager.may_append(seq)
+                self.cross_block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
@@ -60,6 +63,7 @@ class Scheduler:
     def preempt(self, seq: Sequence):
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
+        self.cross_block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
     def postprocess(self, seqs: list[Sequence], token_ids: list[int]) -> list[bool]:
@@ -68,4 +72,5 @@ class Scheduler:
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
+                self.cross_block_manager.deallocate(seq)
                 self.running.remove(seq)

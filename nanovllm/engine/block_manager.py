@@ -25,14 +25,13 @@ class Block:
 
 class BlockManager:
 
-    def __init__(self, num_blocks: int, block_size: int, window_size: int):
+    def __init__(self, num_blocks: int, block_size: int):
         assert num_blocks > 0
         self.block_size = block_size
         self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
         self.hash_to_block_id: dict[int, int] = dict()
         self.free_block_ids: deque[int] = deque(range(num_blocks))
         self.used_block_ids: set[int] = set()
-        self.window_size = window_size
 
     @classmethod
     def compute_hash(cls, token_ids: list[int], prefix: int = -1):
@@ -59,7 +58,7 @@ class BlockManager:
         return len(self.free_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
-        assert not seq.block_table
+        assert not seq.cross_block_table
         h = -1
         cache_miss = False
         for i in range(seq.num_blocks):
@@ -72,7 +71,96 @@ class BlockManager:
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
             else:
-                seq.num_cached_tokens += self.block_size
+                # seq.num_cached_tokens += self.block_size
+                if block_id in self.used_block_ids:
+                    block = self.blocks[block_id]
+                    block.ref_count += 1
+                else:
+                    block = self._allocate_block(block_id)
+            if h != -1:
+                block.update(h, token_ids)
+                self.hash_to_block_id[h] = block_id
+            seq.cross_block_table.append(block_id)
+
+    def deallocate(self, seq: Sequence):
+        for block_id in reversed(seq.cross_block_table):
+            block = self.blocks[block_id]
+            if block.ref_count > 0:
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_block(block_id)
+        seq.num_cached_tokens = 0
+        seq.cross_block_table.clear()
+
+    def can_append(self, seq: Sequence) -> bool:
+        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+
+    def may_append(self, seq: Sequence):
+        cross_block_table = seq.cross_block_table
+        last_block = self.blocks[cross_block_table[-1]]
+        if len(seq) % self.block_size == 1:
+            assert last_block.hash != -1
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            cross_block_table.append(block_id)
+        elif len(seq) % self.block_size == 0:
+            assert last_block.hash == -1
+            token_ids = seq.block(seq.num_blocks-1)
+            prefix = self.blocks[cross_block_table[-2]].hash if len(cross_block_table) > 1 else -1
+            h = self.compute_hash(token_ids, prefix)
+            last_block.update(h, token_ids)
+            self.hash_to_block_id[h] = last_block.block_id
+        else:
+            assert last_block.hash == -1
+
+class SlidingBlockManager(BlockManager):
+
+    def __init__(self, num_blocks: int, block_size: int, window_size: int):
+        assert num_blocks > 0
+        self.block_size = block_size
+        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
+        self.hash_to_block_id: dict[int, int] = dict()
+        self.free_block_ids: deque[int] = deque(range(num_blocks))
+        self.used_block_ids: set[int] = set()
+        self.window_size = window_size
+
+    def _allocate_block(self, block_id: int) -> Block:
+        block = self.blocks[block_id]
+        assert block.ref_count == 0
+        block.reset()
+        self.free_block_ids.remove(block_id)
+        self.used_block_ids.add(block_id)
+        return self.blocks[block_id]
+
+    def _deallocate_block(self, block_id: int) -> Block:
+        assert self.blocks[block_id].ref_count == 0
+        self.used_block_ids.remove(block_id)
+        self.free_block_ids.append(block_id)
+
+    def can_allocate(self, seq: Sequence) -> bool:
+        return len(self.free_block_ids) >= seq.num_blocks
+
+    def allocate(self, seq: Sequence):
+        assert not seq.block_table
+        h = -1
+        cache_miss = False
+        keep_blocks = (self.window_size - seq.last_block_num_tokens + self.block_size - 1 ) // self.block_size + int(seq.last_block_num_tokens > 0)
+
+        for i in range(seq.num_blocks):
+            if i < seq.num_blocks - keep_blocks:
+                seq.num_released_tokens += seq.block_size
+                seq.block_table.append(-1)
+                continue
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                cache_miss = True
+            if cache_miss:
+                block_id = self.free_block_ids[0]
+                block = self._allocate_block(block_id)
+            else:
+                # seq.num_cached_tokens += self.block_size    # TODO prefill cache
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
@@ -91,16 +179,20 @@ class BlockManager:
                 if block.ref_count == 0:
                     self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
+        seq.num_released_tokens = 0
         seq.block_table.clear()
 
     def sliding_deallocate(self, seq: Sequence):
         keep_blocks = (self.window_size - seq.last_block_num_tokens + self.block_size - 1 ) // self.block_size + seq.last_block_num_tokens // 1
+        if keep_blocks >= seq.num_sliding_blocks:
+            return
         for block_id in seq.block_table[:-keep_blocks]:
             block = self.blocks[block_id]
             if block.ref_count > 0:
                 block.ref_count -= 1
                 if block.ref_count == 0:
                     self._deallocate_block(block_id)
+                seq.num_released_tokens += seq.block_size
 
     def can_append(self, seq: Sequence) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
@@ -122,4 +214,7 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
-            self.sliding_deallocate(seq)
+            # print(f"self.used_block_ids: {len(self.used_block_ids)}")
+            self.sliding_deallocate(seq)    # TODO deallocate only when new block is added
+            # print(f"self.used_block_ids: {len(self.used_block_ids)}")
+

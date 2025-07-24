@@ -23,7 +23,9 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        self.num_released_tokens = 0    # for sliding window
         self.block_table = []
+        self.cross_block_table = []     # for cross attention only
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
@@ -57,6 +59,10 @@ class Sequence:
     @property
     def num_blocks(self):
         return (self.num_tokens + self.block_size - 1) // self.block_size
+
+    @property
+    def num_sliding_blocks(self):
+        return len(self.block_table) - self.block_table.count(-1)
 
     @property
     def last_block_num_tokens(self):
