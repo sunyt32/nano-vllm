@@ -108,11 +108,12 @@ class ModelRunner:
         num_kv_heads = model_args.kv_head // self.world_size
         num_cross_kv_heads = model_args.cross_kv_head // self.world_size if model_args.yoco_cross_layers > 0 else 0
         kv_cache_layers = model_args.n_layers - model_args.yoco_cross_layers
-        block_bytes = 2 * kv_cache_layers * self.block_size * num_kv_heads * model_args.head_dim * self.config.dtype.itemsize
+        cross_kv_layer_times = 5 if model_args.yoco_window_size > 0 else 1
+        block_bytes = 2 * (kv_cache_layers+cross_kv_layer_times) * self.block_size * num_kv_heads * model_args.head_dim * self.config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0, "There is no enough GPU memory to allocate KV cache"
         self.kv_cache = torch.zeros(2, kv_cache_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, model_args.head_dim)
-        self.cross_kv_cache = torch.zeros(2, config.num_kvcache_blocks, self.block_size, num_cross_kv_heads, model_args.cross_head_dim) if num_cross_kv_heads > 0 else None
+        self.cross_kv_cache = torch.zeros(2, cross_kv_layer_times*config.num_kvcache_blocks, self.block_size, num_cross_kv_heads, model_args.cross_head_dim) if num_cross_kv_heads > 0 else None
         self.window_size = model_args.yoco_window_size
         print(f"Global kv cache shape: {self.kv_cache.shape}")
         layer_id = 0

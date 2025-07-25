@@ -205,6 +205,7 @@ class SlidingBlockManager(BlockManager):
             block_id = self.free_block_ids[0]
             self._allocate_block(block_id)
             block_table.append(block_id)
+            self.sliding_deallocate(seq)
         elif len(seq) % self.block_size == 0:
             assert last_block.hash == -1
             token_ids = seq.block(seq.num_blocks-1)
@@ -214,7 +215,6 @@ class SlidingBlockManager(BlockManager):
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
-            # print(f"self.used_block_ids: {len(self.used_block_ids)}")
-            self.sliding_deallocate(seq)    # TODO deallocate only when new block is added
-            # print(f"self.used_block_ids: {len(self.used_block_ids)}")
+
+
 

@@ -111,7 +111,7 @@ class Attention(nn.Module):
                 store_kvcache(windowed_k, windowed_v, k_cache, v_cache, context.slot_mapping)
             else:
                 store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        if context.is_prefill and self.is_self_layer:
+        if context.is_prefill and self.is_self_layer:   # self layers prefill
             if self.kv_manager and self.kv_manager.sparse_max_table.numel():
                 self.kv_manager.init_centeroids(k, context.cu_seqlens_q, context.cross_slot_mapping)
             block_table = context.block_tables if context.cu_seqlens_k[-1] > context.cu_seqlens_q[-1] else None
@@ -134,8 +134,9 @@ class Attention(nn.Module):
                                                 sm_scale=self.scale,
                                                 block_size=self.kv_manager.block_size)
             else:
+                block_tables = context.block_tables if self.is_self_layer else context.cross_block_tables
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, block_table=context.cross_block_tables, 
+                                            cache_seqlens=context.context_lens, block_table=block_tables, 
                                             softmax_scale=self.scale, causal=True, window_size=(self.window_size, 0) if self.window_size > 0 else (-1, -1), alibi_slopes=self.alibi_slopes)
         else:
             o = q # only for yoco warmup
