@@ -211,7 +211,7 @@ class ModelRunner:
         sliding_slot_mapping = torch.tensor(sliding_slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, sliding_slot_mapping, context_lens, sliding_block_tables, slot_mapping, block_tables)
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, context_lens, slot_mapping, block_tables, sliding_slot_mapping,  sliding_block_tables)
         return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
@@ -232,7 +232,7 @@ class ModelRunner:
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         sliding_block_tables, block_tables = self.prepare_block_tables(seqs)
-        set_context(False, sliding_slot_mapping=sliding_slot_mapping, context_lens=context_lens, sliding_block_tables=sliding_block_tables, slot_mapping=slot_mapping, block_tables=block_tables)
+        set_context(False, sliding_slot_mapping=sliding_slot_mapping, context_lens=context_lens, slot_mapping=slot_mapping, block_tables=block_tables, sliding_block_tables=sliding_block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
@@ -292,7 +292,7 @@ class ModelRunner:
 
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
-            set_context(False, sliding_slot_mapping=sliding_slot_mapping[:bs], context_lens=context_lens[:bs], sliding_block_tables=sliding_block_tables[:bs], slot_mapping=slot_mapping[:bs], block_tables=block_tables[:bs])
+            set_context(False, context_lens=context_lens[:bs], slot_mapping=slot_mapping[:bs], block_tables=block_tables[:bs], sliding_slot_mapping=sliding_slot_mapping[:bs], sliding_block_tables=sliding_block_tables[:bs])
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
