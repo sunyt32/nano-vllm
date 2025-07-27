@@ -116,29 +116,8 @@ class BlockManager:
 class SlidingBlockManager(BlockManager):
 
     def __init__(self, num_blocks: int, block_size: int, window_size: int):
-        assert num_blocks > 0
-        self.block_size = block_size
-        self.blocks: list[Block] = [Block(i) for i in range(num_blocks)]
-        self.hash_to_block_id: dict[int, int] = dict()
-        self.free_block_ids: deque[int] = deque(range(num_blocks))
-        self.used_block_ids: set[int] = set()
+        super().__init__(num_blocks, block_size)
         self.window_size = window_size
-
-    def _allocate_block(self, block_id: int) -> Block:
-        block = self.blocks[block_id]
-        assert block.ref_count == 0
-        block.reset()
-        self.free_block_ids.remove(block_id)
-        self.used_block_ids.add(block_id)
-        return self.blocks[block_id]
-
-    def _deallocate_block(self, block_id: int) -> Block:
-        assert self.blocks[block_id].ref_count == 0
-        self.used_block_ids.remove(block_id)
-        self.free_block_ids.append(block_id)
-
-    def can_allocate(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= seq.num_blocks
 
     def allocate(self, seq: Sequence):
         assert not seq.block_table
@@ -160,7 +139,6 @@ class SlidingBlockManager(BlockManager):
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
             else:
-                # seq.num_cached_tokens += self.block_size    # TODO prefill cache
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
@@ -193,9 +171,6 @@ class SlidingBlockManager(BlockManager):
                 if block.ref_count == 0:
                     self._deallocate_block(block_id)
                 seq.num_released_tokens += seq.block_size
-
-    def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
 
     def may_append(self, seq: Sequence):
         block_table = seq.block_table

@@ -175,7 +175,7 @@ class ModelRunner:
         context_lens = []
         for seq in seqs:
             seqlen = len(seq)
-            input_ids.extend(seq[seq.num_cached_tokens:])   #  Will num_cached_tokens always be 0 in prefill?
+            input_ids.extend(seq[seq.num_cached_tokens:]) 
             positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             context_lens.append(seqlen)
             seqlen_q = seqlen - seq.num_cached_tokens
