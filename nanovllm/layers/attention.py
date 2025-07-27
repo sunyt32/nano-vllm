@@ -95,18 +95,33 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel() and self.is_self_layer:
-            store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
-        if context.is_prefill and self.is_self_layer:
+            if self.window_size > 0 and context.is_prefill:
+                window_starts = torch.maximum(context.cu_seqlens_k[:-1], context.cu_seqlens_k[1:] - self.window_size)
+                window_ends = torch.minimum(context.cu_seqlens_k[1:], window_starts + self.window_size)
+                indices_list = []
+                for start, end in zip(window_starts, window_ends):
+                    indices_list.append(torch.arange(start.item(), end.item(), device=k.device))
+                indices = torch.cat(indices_list)
+                # indices = torch.cat([
+                #     torch.arange(start.item(), end.item(), device=k.device)
+                #     for start, end in zip(window_starts, window_ends)
+                # ])
+                windowed_k = k.index_select(0, indices)
+                windowed_v = v.index_select(0, indices)
+                store_kvcache(windowed_k, windowed_v, k_cache, v_cache, context.sliding_slot_mapping)
+            else:
+                store_kvcache(k, v, k_cache, v_cache, context.sliding_slot_mapping)
+        if context.is_prefill and self.is_self_layer:   # self layers prefill
             if self.kv_manager and self.kv_manager.sparse_max_table.numel():
                 self.kv_manager.init_centeroids(k, context.cu_seqlens_q, context.slot_mapping)
-            block_table = context.block_tables if context.cu_seqlens_k[-1] > context.cu_seqlens_q[-1] else None
-            if block_table is not None:    # prefix cache
+            sliding_block_tables = context.sliding_block_tables if context.cu_seqlens_k[-1] > context.cu_seqlens_q[-1] else None
+            if sliding_block_tables is not None:    # prefix cache
                 k, v = k_cache, v_cache
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=block_table, window_size=(self.window_size, 0) if self.window_size > 0 else (-1, -1), alibi_slopes=self.alibi_slopes)
-        elif k_cache.numel() and v_cache.numel():    # decode
+                                       softmax_scale=self.scale, causal=True, block_table=sliding_block_tables, window_size=(self.window_size, 0) if self.window_size > 0 else (-1, -1), alibi_slopes=self.alibi_slopes)
+        elif k_cache.numel() and v_cache.numel():    # decode or yoco layers
             if self.kv_manager:
                 if self.is_self_layer:
                     self.kv_manager.update_centeroids(k, context.slot_mapping)
@@ -115,12 +130,13 @@ class Attention(nn.Module):
                                                 cache_seqlens=context.context_lens,
                                                 block_indices=sparse_indices,
                                                 num_selected_blocks=num_selected_blocks,
-                                                block_tables=context.block_tables,
+                                                sliding_block_tables=context.block_tables,
                                                 sm_scale=self.scale,
                                                 block_size=self.kv_manager.block_size)
             else:
+                sliding_block_tables = context.sliding_block_tables if self.is_self_layer else context.block_tables
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, block_table=context.block_tables, 
+                                            cache_seqlens=context.context_lens, block_table=sliding_block_tables, 
                                             softmax_scale=self.scale, causal=True, window_size=(self.window_size, 0) if self.window_size > 0 else (-1, -1), alibi_slopes=self.alibi_slopes)
         else:
             o = q # only for yoco warmup

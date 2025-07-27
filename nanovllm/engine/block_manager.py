@@ -71,7 +71,8 @@ class BlockManager:
                 block_id = self.free_block_ids[0]
                 block = self._allocate_block(block_id)
             else:
-                seq.num_cached_tokens += self.block_size
+                # TODO cache block for yoco layer
+                # seq.num_cached_tokens += self.block_size  
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
                     block.ref_count += 1
@@ -111,3 +112,88 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+class SlidingBlockManager(BlockManager):
+
+    def __init__(self, num_blocks: int, block_size: int, window_size: int):
+        super().__init__(num_blocks, block_size)
+        self.window_size = window_size
+
+    def allocate(self, seq: Sequence):
+        assert not seq.sliding_block_table
+        h = -1
+        cache_miss = False
+        keep_blocks = (self.window_size - seq.last_block_num_tokens + self.block_size - 1 ) // self.block_size + int(seq.last_block_num_tokens > 0)
+
+        for i in range(seq.num_blocks):
+            if i < seq.num_blocks - keep_blocks:
+                seq.num_released_tokens += seq.block_size
+                seq.sliding_block_table.append(-1)
+                continue
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+            block_id = self.hash_to_block_id.get(h, -1)
+            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+                cache_miss = True
+            if cache_miss:
+                block_id = self.free_block_ids[0]
+                block = self._allocate_block(block_id)
+            else:
+                if block_id in self.used_block_ids:
+                    block = self.blocks[block_id]
+                    block.ref_count += 1
+                else:
+                    block = self._allocate_block(block_id)
+                # TODO cache block when seqence length is less than window size
+                # if i == 0 or (seq.sliding_block_table and len(seq.sliding_block_table) > 0 and seq.sliding_block_table[0] != -1):
+                #     # This happens when all the block are within the sliding window
+                #     seq.num_cached_tokens += self.block_size
+            if h != -1:
+                block.update(h, token_ids)
+                self.hash_to_block_id[h] = block_id
+            seq.sliding_block_table.append(block_id)
+
+    def deallocate(self, seq: Sequence):
+        for block_id in reversed(seq.sliding_block_table):
+            block = self.blocks[block_id]
+            if block.ref_count > 0:
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_block(block_id)
+        seq.num_cached_tokens = 0
+        seq.num_released_tokens = 0
+        seq.sliding_block_table.clear()
+
+    def sliding_deallocate(self, seq: Sequence):
+        keep_blocks = (self.window_size - seq.last_block_num_tokens + self.block_size - 1 ) // self.block_size + seq.last_block_num_tokens // 1
+        if keep_blocks >= seq.num_sliding_blocks:
+            return
+        for block_id in seq.sliding_block_table[:-keep_blocks]:
+            block = self.blocks[block_id]
+            if block.ref_count > 0:
+                block.ref_count -= 1
+                if block.ref_count == 0:
+                    self._deallocate_block(block_id)
+                seq.num_released_tokens += seq.block_size
+
+    def may_append(self, seq: Sequence):
+        sliding_block_table = seq.sliding_block_table
+        last_block = self.blocks[sliding_block_table[-1]]
+        if len(seq) % self.block_size == 1:
+            assert last_block.hash != -1
+            block_id = self.free_block_ids[0]
+            self._allocate_block(block_id)
+            sliding_block_table.append(block_id)
+            self.sliding_deallocate(seq)
+        elif len(seq) % self.block_size == 0:
+            assert last_block.hash == -1
+            token_ids = seq.block(seq.num_blocks-1)
+            prefix = self.blocks[sliding_block_table[-2]].hash if len(sliding_block_table) > 1 else -1
+            h = self.compute_hash(token_ids, prefix)
+            last_block.update(h, token_ids)
+            self.hash_to_block_id[h] = last_block.block_id
+        else:
+            assert last_block.hash == -1
+
+
+

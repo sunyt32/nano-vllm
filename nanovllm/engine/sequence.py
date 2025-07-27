@@ -27,6 +27,9 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        # for sliding window
+        self.num_released_tokens = 0    
+        self.sliding_block_table = []
 
     def __len__(self):
         return self.num_tokens
@@ -59,6 +62,10 @@ class Sequence:
         return (self.num_tokens + self.block_size - 1) // self.block_size
 
     @property
+    def num_sliding_blocks(self):
+        return len(self.sliding_block_table) - self.sliding_block_table.count(-1)
+
+    @property
     def last_block_num_tokens(self):
         return self.num_tokens - (self.num_blocks - 1) * self.block_size
 
@@ -72,11 +79,11 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
+        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.sliding_block_table,
                 self.token_ids if self.num_completion_tokens == 0 else self.last_token)
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
+        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.sliding_block_table = state[:-1]
         if self.num_completion_tokens == 0:
             self.token_ids = state[-1]
         else:
