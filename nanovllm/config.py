@@ -42,6 +42,7 @@ class Config:
     dtype: torch.dtype = torch.float16
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    num_cross_kvcache_blocks: int = -1
     sparse_decoding: bool = False
     sparse_block_size: int = 16
     sparse_block_ratio: float = 0.1
@@ -77,7 +78,6 @@ class Config:
             }
             modelargs = ModelArgs(**params)
         self.model_args = modelargs
-        # self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
 
     @classmethod

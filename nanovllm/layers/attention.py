@@ -40,8 +40,9 @@ def store_kvcache_kernel(
     value = tl.load(value_ptr + value_offsets)
     slot = tl.load(slot_mapping_ptr + idx).to(tl.int64)
     cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
+    mask = slot >= 0
+    tl.store(k_cache_ptr + cache_offsets, key, mask=mask)
+    tl.store(v_cache_ptr + cache_offsets, value, mask=mask)
 
 
 def store_kvcache(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
@@ -84,7 +85,7 @@ class Attention(nn.Module):
         self.tp_rank = dist.get_rank()
         self.tp_size = dist.get_world_size()
         self.alibi_slopes = torch.tensor(get_slopes(self.num_heads), dtype=torch.float32).chunk(self.tp_size, dim=0)[self.tp_rank] if alibi else None
-        self.kv_manager = KVManager(num_kv_heads, sparse_block_size, sparse_block_ratio, sparse_local_num_blocks, sparse_min_num_blocks) if sparse_decoding and self.window_size > 0 else None
+        self.kv_manager = KVManager(num_kv_heads, sparse_block_size, sparse_block_ratio, sparse_local_num_blocks, sparse_min_num_blocks) if sparse_decoding and self.window_size == -1 else None
 
     def forward(self, q: torch.Tensor, k: torch.Tensor | None, v: torch.Tensor | None):
         o: torch.Tensor
@@ -95,32 +96,22 @@ class Attention(nn.Module):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
         if k_cache.numel() and v_cache.numel() and self.is_self_layer:
-            if self.window_size > 0 and context.is_prefill:
-                window_starts = torch.maximum(context.cu_seqlens_k[:-1], context.cu_seqlens_k[1:] - self.window_size)
-                window_ends = torch.minimum(context.cu_seqlens_k[1:], window_starts + self.window_size)
-                indices_list = []
-                for start, end in zip(window_starts, window_ends):
-                    indices_list.append(torch.arange(start.item(), end.item(), device=k.device))
-                indices = torch.cat(indices_list)
-                # indices = torch.cat([
-                #     torch.arange(start.item(), end.item(), device=k.device)
-                #     for start, end in zip(window_starts, window_ends)
-                # ])
-                windowed_k = k.index_select(0, indices)
-                windowed_v = v.index_select(0, indices)
-                store_kvcache(windowed_k, windowed_v, k_cache, v_cache, context.sliding_slot_mapping)
-            else:
+            if self.window_size > 0:
                 store_kvcache(k, v, k_cache, v_cache, context.sliding_slot_mapping)
+            else:
+                store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill and self.is_self_layer:   # self layers prefill
             if self.kv_manager and self.kv_manager.sparse_max_table.numel():
                 self.kv_manager.init_centeroids(k, context.cu_seqlens_q, context.slot_mapping)
-            sliding_block_tables = context.sliding_block_tables if context.cu_seqlens_k[-1] > context.cu_seqlens_q[-1] else None
-            if sliding_block_tables is not None:    # prefix cache
+            if context.cu_seqlens_k[-1] > context.cu_seqlens_q[-1]:
+                block_tables = context.sliding_block_tables if self.window_size > 0 else context.block_tables
                 k, v = k_cache, v_cache
+            else:
+                block_tables = None
             o = flash_attn_varlen_func(q, k, v,
                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
                                        max_seqlen_k=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                       softmax_scale=self.scale, causal=True, block_table=sliding_block_tables, window_size=(self.window_size, 0) if self.window_size > 0 else (-1, -1), alibi_slopes=self.alibi_slopes)
+                                       softmax_scale=self.scale, causal=True, block_table=block_tables, window_size=(self.window_size, 0) if self.window_size > 0 else (-1, -1), alibi_slopes=self.alibi_slopes)
         elif k_cache.numel() and v_cache.numel():    # decode or yoco layers
             if self.kv_manager:
                 if self.is_self_layer:
@@ -130,13 +121,13 @@ class Attention(nn.Module):
                                                 cache_seqlens=context.context_lens,
                                                 block_indices=sparse_indices,
                                                 num_selected_blocks=num_selected_blocks,
-                                                sliding_block_tables=context.block_tables,
+                                                block_tables=context.block_tables,
                                                 sm_scale=self.scale,
                                                 block_size=self.kv_manager.block_size)
             else:
-                sliding_block_tables = context.sliding_block_tables if self.is_self_layer else context.block_tables
+                block_tables = context.sliding_block_tables if self.window_size > 0 else context.block_tables
                 o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache,
-                                            cache_seqlens=context.context_lens, block_table=sliding_block_tables, 
+                                            cache_seqlens=context.context_lens, block_table=block_tables,
                                             softmax_scale=self.scale, causal=True, window_size=(self.window_size, 0) if self.window_size > 0 else (-1, -1), alibi_slopes=self.alibi_slopes)
         else:
             o = q # only for yoco warmup

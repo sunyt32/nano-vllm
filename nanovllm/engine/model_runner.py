@@ -107,15 +107,17 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = model_args.kv_head // self.world_size
         num_cross_kv_heads = model_args.cross_kv_head // self.world_size if model_args.yoco_cross_layers > 0 else 0
+        cross_head_dim = model_args.cross_head_dim if model_args.yoco_cross_layers > 0 else 0
         kv_cache_layers = model_args.n_layers - model_args.yoco_cross_layers
-        cross_kv_layer_times = 5 if model_args.yoco_window_size > 0 else 1
-        block_bytes = 2 * (kv_cache_layers+cross_kv_layer_times) * self.block_size * num_kv_heads * model_args.head_dim * self.config.dtype.itemsize
+        cross_kv_layer_times = math.ceil(self.config.max_model_len / model_args.yoco_window_size) if model_args.yoco_cross_layers > 0 else 0
+        block_bytes = 2 * (kv_cache_layers * num_kv_heads * model_args.head_dim + cross_kv_layer_times * num_cross_kv_heads * cross_head_dim) * self.block_size * self.config.dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+        config.num_cross_kvcache_blocks = config.num_kvcache_blocks * cross_kv_layer_times
         assert config.num_kvcache_blocks > 0, "There is no enough GPU memory to allocate KV cache"
         self.kv_cache = torch.zeros(2, kv_cache_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, model_args.head_dim)
-        self.cross_kv_cache = torch.zeros(2, cross_kv_layer_times*config.num_kvcache_blocks, self.block_size, num_cross_kv_heads, model_args.cross_head_dim) if num_cross_kv_heads > 0 else None
+        self.cross_kv_cache = torch.zeros(2, config.num_cross_kvcache_blocks, self.block_size, num_cross_kv_heads, cross_head_dim) if model_args.yoco_cross_layers > 0 else None
         self.window_size = model_args.yoco_window_size
-        print(f"Global kv cache shape: {self.kv_cache.shape}")
+        print(f"Global kv cache shape: {self.kv_cache.shape}, Cross kv cache upsampling factor: {cross_kv_layer_times}")
         layer_id = 0
         for module in self.model.model.layers[:kv_cache_layers].modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
@@ -130,21 +132,20 @@ class ModelRunner:
             sparse_indices_per_block = self.block_size // config.sparse_block_size
             max_num_blocks = config.max_model_len // config.sparse_block_size
             max_num_selected_blocks = math.ceil(max_num_blocks * config.sparse_block_ratio)
-            self.sparse_max_tables = torch.zeros(kv_cache_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, model_args.head_dim)
-            self.sparse_min_tables = torch.zeros(kv_cache_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, model_args.head_dim)
-            self.cross_sparse_max_tables = torch.zeros(config.num_kvcache_blocks, sparse_indices_per_block, num_cross_kv_heads, model_args.cross_head_dim) if num_cross_kv_heads > 0 else None
-            self.cross_sparse_min_tables = torch.zeros(config.num_kvcache_blocks, sparse_indices_per_block, num_cross_kv_heads, model_args.cross_head_dim) if num_cross_kv_heads > 0 else None
-            layer_id = 0
-            for module in self.model.model.layers[kv_cache_layers:].modules():
-                if hasattr(module, "kv_manager"):
-                    module.kv_manager.sparse_max_table = self.sparse_max_tables[layer_id]
-                    module.kv_manager.sparse_min_table = self.sparse_min_tables[layer_id]
-                    module.kv_manager.max_num_blocks = max_num_blocks
-                    module.kv_manager.max_num_selected_blocks = max_num_selected_blocks
-                    layer_id += 1
-                    if layer_id == kv_cache_layers:
-                        break
-            if self.cross_sparse_max_tables is not None:
+            if model_args.yoco_cross_layers == 0:
+                self.sparse_max_tables = torch.zeros(kv_cache_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, model_args.head_dim)
+                self.sparse_min_tables = torch.zeros(kv_cache_layers, config.num_kvcache_blocks, sparse_indices_per_block, num_kv_heads, model_args.head_dim)
+                layer_id = 0
+                for module in self.model.model.layers.modules():
+                    if hasattr(module, "kv_manager"):
+                        module.kv_manager.sparse_max_table = self.sparse_max_tables[layer_id]
+                        module.kv_manager.sparse_min_table = self.sparse_min_tables[layer_id]
+                        module.kv_manager.max_num_blocks = max_num_blocks
+                        module.kv_manager.max_num_selected_blocks = max_num_selected_blocks
+                        layer_id += 1
+            else:
+                self.cross_sparse_max_tables = torch.zeros(config.num_cross_kvcache_blocks, sparse_indices_per_block, num_cross_kv_heads, model_args.cross_head_dim)
+                self.cross_sparse_min_tables = torch.zeros(config.num_cross_kvcache_blocks, sparse_indices_per_block, num_cross_kv_heads, model_args.cross_head_dim)
                 self.model.model.shared_attention.kv_manager.sparse_max_table = self.cross_sparse_max_tables
                 self.model.model.shared_attention.kv_manager.sparse_min_table = self.cross_sparse_min_tables
                 self.model.model.shared_attention.kv_manager.max_num_blocks = max_num_blocks
@@ -186,16 +187,17 @@ class ModelRunner:
             max_seqlen_k = max(seqlen_k, max_seqlen_k)
             if not seq.sliding_block_table:
                 continue
-            sliding_start_idx = max(seq.num_cached_blocks, seq.num_blocks - seq.num_sliding_blocks)
-            tmp_slot_mapping = []
-            for i in range(sliding_start_idx, seq.num_blocks):
-                start = seq.sliding_block_table[i] * self.block_size
-                if i != seq.num_blocks - 1:
-                    end = start + self.block_size
+            sliding_start_idx = seq.num_blocks - seq.num_sliding_blocks
+            for i in range(seq.num_cached_blocks, seq.num_blocks):
+                if i < sliding_start_idx:
+                    sliding_slot_mapping.extend([-1] * self.block_size)
                 else:
-                    end = start + seq.last_block_num_tokens
-                tmp_slot_mapping.extend(list(range(start, end)))
-            sliding_slot_mapping.extend(tmp_slot_mapping[-self.window_size:])
+                    start = seq.sliding_block_table[i] * self.block_size
+                    if i != seq.num_blocks - 1:
+                        end = start + self.block_size
+                    else:
+                        end = start + seq.last_block_num_tokens
+                    sliding_slot_mapping.extend(list(range(start, end)))
             for i in range(seq.num_cached_blocks, seq.num_blocks):
                 start = seq.block_table[i] * self.block_size
                 if i != seq.num_blocks - 1:

@@ -119,16 +119,20 @@ class SlidingBlockManager(BlockManager):
         super().__init__(num_blocks, block_size)
         self.window_size = window_size
 
+    def can_allocate(self, seq: Sequence) -> bool:
+        keep_blocks = (self.window_size - seq.last_block_num_tokens + self.block_size - 1) // self.block_size + int(seq.last_block_num_tokens > 0)
+        return len(self.free_block_ids) >= keep_blocks
+
     def allocate(self, seq: Sequence):
         assert not seq.sliding_block_table
         h = -1
         cache_miss = False
-        keep_blocks = (self.window_size - seq.last_block_num_tokens + self.block_size - 1 ) // self.block_size + int(seq.last_block_num_tokens > 0)
-
+        keep_blocks = (self.window_size - seq.last_block_num_tokens + self.block_size - 1) // self.block_size + int(seq.last_block_num_tokens > 0)
         for i in range(seq.num_blocks):
             if i < seq.num_blocks - keep_blocks:
                 seq.num_released_tokens += seq.block_size
                 seq.sliding_block_table.append(-1)
+                h = self.compute_hash(seq.block(i), h) 
                 continue
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
@@ -155,6 +159,8 @@ class SlidingBlockManager(BlockManager):
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.sliding_block_table):
+            if block_id == -1:
+                continue
             block = self.blocks[block_id]
             if block.ref_count > 0:
                 block.ref_count -= 1
@@ -165,10 +171,12 @@ class SlidingBlockManager(BlockManager):
         seq.sliding_block_table.clear()
 
     def sliding_deallocate(self, seq: Sequence):
-        keep_blocks = (self.window_size - seq.last_block_num_tokens + self.block_size - 1 ) // self.block_size + seq.last_block_num_tokens // 1
+        keep_blocks = (self.window_size - seq.last_block_num_tokens + self.block_size - 1) // self.block_size + int(seq.last_block_num_tokens > 0)
         if keep_blocks >= seq.num_sliding_blocks:
             return
         for block_id in seq.sliding_block_table[:-keep_blocks]:
+            if block_id == -1:
+                continue
             block = self.blocks[block_id]
             if block.ref_count > 0:
                 block.ref_count -= 1

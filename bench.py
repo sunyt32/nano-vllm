@@ -9,8 +9,8 @@ from torch.profiler import profile, ProfilerActivity
 
 def main():
     seed(0)
-    num_seqs = 8
-    max_input_len = 65000
+    num_seqs = 512
+    max_input_len = 130000
     max_output_len = 100
 
     config = Config.from_args()

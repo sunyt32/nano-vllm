@@ -12,7 +12,7 @@ class Scheduler:
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.sliding_block_manager = SlidingBlockManager(config.num_kvcache_blocks, config.kvcache_block_size, config.model_args.yoco_window_size)
-        self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.block_manager = BlockManager(config.num_cross_kvcache_blocks if config.num_cross_kvcache_blocks > 0 else config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
@@ -34,7 +34,7 @@ class Scheduler:
             num_seqs += 1
             self.sliding_block_manager.allocate(seq)
             self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens - seq.num_released_tokens
+            num_batched_tokens += len(seq) - seq.num_cached_tokens
             seq.status = SequenceStatus.RUNNING
             self.waiting.popleft()
             self.running.append(seq)

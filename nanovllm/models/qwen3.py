@@ -235,7 +235,7 @@ class Qwen3Model(nn.Module):
             h_norm, _ = self.kv_norm(hidden_states, residual)
             kv = self.kv_proj(h_norm)
             key, value = kv.chunk(2, dim=-1)
-            self.shared_attention.fill_kvcache(key, value)
+            self.shared_attention.fill_kvcache(key.contiguous(), value.contiguous())
         context = get_context()
         if context.is_prefill:
             last_indices = context.cu_seqlens_q[1:] - 1
