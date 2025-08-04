@@ -39,7 +39,7 @@ class Config:
     model_args: ModelArgs | None = None
     checkpoint: str | None = None
     eos: int = -1
-    dtype: torch.dtype = torch.float16
+    dtype: torch.dtype = torch.bfloat16
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     num_cross_kvcache_blocks: int = -1

@@ -12,7 +12,6 @@ from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
-
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -288,14 +287,19 @@ class ModelRunner:
         sliding_block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
         outputs = torch.zeros(max_bs, model_args.d_model)
-        self.graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.graph_bs = [1, 2, 4, 8]
+        if max_bs < 16:
+            self.graph_bs.append(max_bs)
+        else:
+            self.graph_bs += list(range(16, max_bs + 1, 16))
         self.graphs = {}
         self.graph_pool = None
 
         for bs in reversed(self.graph_bs):
-            graph = torch.cuda.CUDAGraph()
             set_context(False, context_lens=context_lens[:bs], slot_mapping=slot_mapping[:bs], block_tables=block_tables[:bs], sliding_slot_mapping=sliding_slot_mapping[:bs], sliding_block_tables=sliding_block_tables[:bs])
-            outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            for _ in range(2):
+                outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
+            graph = torch.cuda.CUDAGraph()
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
             if self.graph_pool is None:

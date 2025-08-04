@@ -29,6 +29,7 @@ class LLMEngine:
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
+        self.warmup_model_runner()
         atexit.register(self.exit)
 
     def exit(self):
@@ -36,6 +37,10 @@ class LLMEngine:
         del self.model_runner
         for p in self.ps:
             p.join()
+
+    def warmup_model_runner(self):
+        warmup_prompts = [[0] * self.config.max_model_len]
+        self.generate(warmup_prompts, SamplingParams(temperature=0.6, max_tokens=256, ignore_eos=True), use_tqdm=False)
 
     def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
         if isinstance(prompt, str):
